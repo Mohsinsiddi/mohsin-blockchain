@@ -1,0 +1,57 @@
+[chain]
+chain_id = "mvm-mainnet-1"
+chain_name = "Mohsin Virtual Machine"
+
+[block]
+block_time = 3
+gas_limit = 1000000
+max_txs_per_block = 100
+
+[rewards]
+block_reward = 10
+validator_percent = 70
+service_pool_percent = 30
+top_nodes = 3
+rank_1_percent = 50
+rank_2_percent = 33
+rank_3_percent = 17
+
+[genesis]
+master_address = ""
+master_balance = 0
+
+[faucet]
+enabled = false
+amount = 100
+cooldown = 3600
+
+[token]
+name = "MVM"
+symbol = "MVM"
+decimals = 18
+
+[node]
+id = "node-2"
+type = "full"
+data_dir = "./data-node2"
+
+[network]
+topology = "star"
+host = "0.0.0.0"
+p2p_port = 9001
+ws_port = 8547
+api_port = 8555
+
+[network.star]
+master_url = "ws://localhost:8546/p2p"
+
+[validators]
+addresses = []
+max_validators = 21
+
+[pruning]
+keep_blocks = 1000
+keep_txs = 100
+
+[logging]
+level = "info"

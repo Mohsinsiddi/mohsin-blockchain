@@ -1,0 +1,7 @@
+/target
+/data
+/data-node2
+/data-node3
+Cargo.lock
+*.log
+.DS_Store
