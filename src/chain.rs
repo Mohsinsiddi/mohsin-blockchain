@@ -104,6 +104,8 @@ pub enum TxType {
     Call,
     CreateToken,
     TransferToken,
+    DeployContract,
+    CallContract,
 }
 
 impl TxType {
@@ -114,6 +116,8 @@ impl TxType {
             TxType::Call => "call",
             TxType::CreateToken => "create_token",
             TxType::TransferToken => "transfer_token",
+            TxType::DeployContract => "deploy_contract",
+            TxType::CallContract => "call_contract",
         }
     }
 }
@@ -124,6 +128,27 @@ pub enum TxData {
     Call { contract: String, method: String, args: Vec<String> },
     CreateToken { name: String, symbol: String, total_supply: u64 },
     TransferToken { contract: String, to: String, amount: u64 },
+    // Mosh Contract Deployment
+    DeployContract { 
+        name: String, 
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default)]
+        variables: Vec<crate::mvm::VarDef>,
+        #[serde(default)]
+        mappings: Vec<crate::mvm::MappingDef>,
+        #[serde(default)]
+        functions: Vec<crate::mvm::FnDef>,
+    },
+    // Mosh Contract Call
+    CallContract { 
+        contract: String, 
+        method: String, 
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amount: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -361,6 +386,8 @@ impl Blockchain {
             TxType::Call => 50000,
             TxType::CreateToken => 100000,
             TxType::TransferToken => 65000,
+            TxType::DeployContract => 150000,
+            TxType::CallContract => 50000,  // Base, actual depends on method
         };
 
         // Verify signature
@@ -502,6 +529,59 @@ impl Blockchain {
                     state_guard.increment_nonce(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                     
                     drop(token);
+                }
+            }
+            TxType::DeployContract => {
+                if let Some(TxData::DeployContract { name, token, variables, mappings, functions }) = &tx.data {
+                    let mut state_guard = self.state.write().await;
+                    let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
+                    // Deduct gas fee
+                    state_guard.set_balance(&tx.from, from_balance - gas_fee).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
+                    // Deploy Mosh contract
+                    let contract_addr = self.mvm.deploy(
+                        &mut state_guard,
+                        &tx.from,
+                        name,
+                        token.clone(),
+                        variables.clone(),
+                        mappings.clone(),
+                        functions.clone(),
+                    ).map_err(|e| TxError::ContractError { message: e.to_string() })?;
+                    
+                    tx.to = Some(contract_addr);
+                    state_guard.increment_nonce(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                }
+            }
+            TxType::CallContract => {
+                if let Some(TxData::CallContract { contract, method, args, amount }) = &tx.data {
+                    let mut state_guard = self.state.write().await;
+                    let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
+                    // Deduct base gas fee
+                    state_guard.set_balance(&tx.from, from_balance - gas_fee).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
+                    // Call Mosh contract
+                    let result = self.mvm.call(
+                        &mut state_guard,
+                        &tx.from,
+                        contract,
+                        method,
+                        args.clone(),
+                        amount.unwrap_or(0),
+                    ).map_err(|e| TxError::ContractError { message: e.to_string() })?;
+                    
+                    tx.gas_used = result.gas_used;
+                    
+                    if !result.success {
+                        return Err(TxError::ContractError { 
+                            message: result.error.unwrap_or("Unknown error".to_string())
+                        });
+                    }
+                    
+                    tx.to = Some(contract.clone());
+                    state_guard.increment_nonce(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                 }
             }
         }

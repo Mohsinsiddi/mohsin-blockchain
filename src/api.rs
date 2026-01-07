@@ -59,6 +59,10 @@ pub async fn start_api_server(
         .route("/tokens/holder/:address", get(get_token_holdings))
         .route("/token/:address", get(get_token))
         .route("/token/:contract/balance/:address", get(get_token_balance))
+        .route("/contracts", get(get_contracts))
+        .route("/contracts/creator/:address", get(get_contracts_by_creator))
+        .route("/contract/:address", get(get_contract))
+        .route("/contract/:address/mapping/:name", get(get_contract_mapping))
         .route("/wallet/new", get(create_wallet))
         .route("/ws", get(ws_handler))
         .route("/p2p", get(p2p_handler))
@@ -76,7 +80,8 @@ pub async fn start_api_server(
 async fn index() -> impl IntoResponse {
     Json(serde_json::json!({
         "name": "MOHSIN VIRTUAL MACHINE",
-        "version": "0.1.0",
+        "version": "0.3.0",
+        "language": "Mosh",
         "endpoints": {
             "status": "GET /status",
             "block": "GET /block/:height",
@@ -94,9 +99,29 @@ async fn index() -> impl IntoResponse {
             "tokens_by_holder": "GET /tokens/holder/:address",
             "token_info": "GET /token/:address",
             "token_balance": "GET /token/:contract/balance/:address",
+            "contracts": "GET /contracts",
+            "contracts_by_creator": "GET /contracts/creator/:address",
+            "contract_info": "GET /contract/:address",
+            "contract_mapping": "GET /contract/:address/mapping/:name",
             "create_wallet": "GET /wallet/new",
             "websocket": "WS /ws",
             "p2p": "WS /p2p"
+        },
+        "tx_types": [
+            "transfer",
+            "create_token",
+            "transfer_token",
+            "deploy_contract",
+            "call_contract"
+        ],
+        "contract_features": {
+            "variables": ["uint64", "string", "bool", "address"],
+            "mappings": "mapping(key_type => value_type)",
+            "functions": {
+                "modifiers": ["view", "write", "payable", "onlyOwner"],
+                "operations": ["set", "add", "sub", "map_set", "map_add", "map_sub", "require", "transfer", "return", "let"]
+            },
+            "auto_methods": ["get_<var>", "set_<var>", "get_owner", "set_owner"]
         }
     }))
 }
@@ -436,6 +461,197 @@ async fn get_token_holdings(
     })).into_response()
 }
 
+// ===== MOSH CONTRACT ENDPOINTS =====
+
+async fn get_contracts(
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    let contracts = state_guard.get_all_mosh_contracts().unwrap_or_default();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "count": contracts.len(),
+        "contracts": contracts.iter().map(|c| serde_json::json!({
+            "address": c.address,
+            "name": c.name,
+            "creator": c.creator,
+            "owner": c.owner,
+            "token": c.token,
+            "variables": c.variables.len(),
+            "mappings": c.mappings.len(),
+            "functions": c.functions.iter().map(|f| &f.name).collect::<Vec<_>>(),
+            "created_at": c.created_at
+        })).collect::<Vec<_>>()
+    }))
+}
+
+async fn get_contracts_by_creator(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let addr = Address::new(&address);
+    if !addr.is_valid() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "invalid_address",
+            "message": format!("Invalid address: {}", address)
+        }))).into_response();
+    }
+
+    let state_guard = state.state.read().await;
+    let contracts = state_guard.get_mosh_contracts_by_creator(&address).unwrap_or_default();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "creator": address,
+        "count": contracts.len(),
+        "contracts": contracts.iter().map(|c| serde_json::json!({
+            "address": c.address,
+            "name": c.name,
+            "token": c.token,
+            "functions": c.functions.len(),
+            "created_at": c.created_at
+        })).collect::<Vec<_>>()
+    })).into_response()
+}
+
+async fn get_contract(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    
+    match state_guard.get_mosh_contract(&address) {
+        Ok(Some(c)) => {
+            // Get current variable values
+            let mut var_values = Vec::new();
+            for var in &c.variables {
+                let value = state_guard.get_mosh_var(&address, &var.name)
+                    .unwrap_or(None)
+                    .unwrap_or_default();
+                var_values.push(serde_json::json!({
+                    "name": var.name,
+                    "type": format!("{:?}", var.var_type),
+                    "value": value
+                }));
+            }
+            
+            // Get token info if linked
+            let token_info = if let Some(ref token_addr) = c.token {
+                state_guard.get_token(token_addr).ok().flatten().map(|t| serde_json::json!({
+                    "address": t.address,
+                    "name": t.name,
+                    "symbol": t.symbol
+                }))
+            } else {
+                None
+            };
+            
+            // Build methods list
+            let mut getters: Vec<String> = c.variables.iter().map(|v| format!("get_{}", v.name)).collect();
+            let mut setters: Vec<String> = c.variables.iter().map(|v| format!("set_{}", v.name)).collect();
+            
+            // Add mapping getters/setters
+            for m in &c.mappings {
+                getters.push(format!("get_{}", m.name));
+                setters.push(format!("set_{}", m.name));
+            }
+            
+            // User functions
+            let user_functions: Vec<serde_json::Value> = c.functions.iter().map(|f| {
+                serde_json::json!({
+                    "name": f.name,
+                    "modifiers": f.modifiers.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>(),
+                    "args": f.args.iter().map(|a| serde_json::json!({
+                        "name": a.name,
+                        "type": format!("{:?}", a.arg_type)
+                    })).collect::<Vec<_>>()
+                })
+            }).collect();
+            
+            Json(serde_json::json!({
+                "success": true,
+                "contract": {
+                    "address": c.address,
+                    "name": c.name,
+                    "creator": c.creator,
+                    "owner": c.owner,
+                    "created_at": c.created_at,
+                    "token": c.token,
+                    "token_info": token_info
+                },
+                "variables": var_values,
+                "mappings": c.mappings.iter().map(|m| serde_json::json!({
+                    "name": m.name,
+                    "key_type": format!("{:?}", m.key_type),
+                    "value_type": format!("{:?}", m.value_type)
+                })).collect::<Vec<_>>(),
+                "functions": user_functions,
+                "auto_methods": {
+                    "getters": getters,
+                    "setters": setters,
+                    "reserved": ["get_owner", "set_owner", "get_creator", "get_token", "get_address"]
+                }
+            })).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "contract_not_found",
+            "message": format!("Contract not found: {}", address)
+        }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": "internal_error",
+            "message": e.to_string()
+        }))).into_response(),
+    }
+}
+
+async fn get_contract_mapping(
+    Path((address, map_name)): Path<(String, String)>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    
+    match state_guard.get_mosh_contract(&address) {
+        Ok(Some(c)) => {
+            // Check mapping exists
+            let mapping = c.mappings.iter().find(|m| m.name == map_name);
+            if mapping.is_none() {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                    "success": false,
+                    "error": "mapping_not_found",
+                    "message": format!("Mapping '{}' not found", map_name)
+                }))).into_response();
+            }
+            
+            let entries = state_guard.get_all_mosh_map_entries(&address, &map_name).unwrap_or_default();
+            
+            Json(serde_json::json!({
+                "success": true,
+                "contract": address,
+                "mapping": map_name,
+                "count": entries.len(),
+                "entries": entries.iter().map(|(k, v)| serde_json::json!({
+                    "key": k,
+                    "value": v
+                })).collect::<Vec<_>>()
+            })).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "contract_not_found",
+            "message": format!("Contract not found: {}", address)
+        }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": "internal_error",
+            "message": e.to_string()
+        }))).into_response(),
+    }
+}
+
 async fn create_wallet() -> impl IntoResponse {
     let keypair = crate::address::Keypair::generate();
     let address = keypair.address();
@@ -562,6 +778,60 @@ async fn sign_transaction(
                     .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default(),
             }),
+            "deploy_contract" => {
+                let variables: Vec<crate::mvm::VarDef> = d["variables"].as_array()
+                    .map(|arr| arr.iter().filter_map(|v| {
+                        Some(crate::mvm::VarDef {
+                            name: v["name"].as_str()?.to_string(),
+                            var_type: crate::mvm::VarType::from_str(v["type"].as_str()?)?,
+                            default: v["default"].as_str().map(|s| s.to_string()),
+                        })
+                    }).collect()).unwrap_or_default();
+                let mappings: Vec<crate::mvm::MappingDef> = d["mappings"].as_array()
+                    .map(|arr| arr.iter().filter_map(|m| {
+                        Some(crate::mvm::MappingDef {
+                            name: m["name"].as_str()?.to_string(),
+                            key_type: crate::mvm::VarType::from_str(m["key_type"].as_str()?)?,
+                            value_type: crate::mvm::VarType::from_str(m["value_type"].as_str()?)?,
+                        })
+                    }).collect()).unwrap_or_default();
+                let functions: Vec<crate::mvm::FnDef> = d["functions"].as_array()
+                    .map(|arr| arr.iter().filter_map(|f| {
+                        Some(crate::mvm::FnDef {
+                            name: f["name"].as_str()?.to_string(),
+                            modifiers: f["modifiers"].as_array()
+                                .map(|m| m.iter().filter_map(|x| match x.as_str()?.to_lowercase().as_str() {
+                                    "view" => Some(crate::mvm::FnModifier::View),
+                                    "write" => Some(crate::mvm::FnModifier::Write),
+                                    "payable" => Some(crate::mvm::FnModifier::Payable),
+                                    "onlyowner" | "only_owner" => Some(crate::mvm::FnModifier::OnlyOwner),
+                                    _ => None,
+                                }).collect()).unwrap_or_default(),
+                            args: f["args"].as_array()
+                                .map(|a| a.iter().filter_map(|x| Some(crate::mvm::FnArg {
+                                    name: x["name"].as_str()?.to_string(),
+                                    arg_type: crate::mvm::VarType::from_str(x["type"].as_str()?)?,
+                                })).collect()).unwrap_or_default(),
+                            body: f["body"].as_array()
+                                .map(|b| b.iter().filter_map(|x| serde_json::from_value(x.clone()).ok()).collect())
+                                .unwrap_or_default(),
+                            returns: f["returns"].as_str().and_then(|s| crate::mvm::VarType::from_str(s)),
+                        })
+                    }).collect()).unwrap_or_default();
+                Some(TxData::DeployContract {
+                    name: d["name"].as_str().unwrap_or("").to_string(),
+                    token: d["token"].as_str().map(|s| s.to_string()),
+                    variables, mappings, functions,
+                })
+            },
+            "call_contract" => Some(TxData::CallContract {
+                contract: d["contract"].as_str().unwrap_or("").to_string(),
+                method: d["method"].as_str().unwrap_or("").to_string(),
+                args: d["args"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default(),
+                amount: d["amount"].as_u64(),
+            }),
             _ => None
         }
     } else {
@@ -635,10 +905,12 @@ async fn submit_transaction(
         "call" => TxType::Call,
         "create_token" => TxType::CreateToken,
         "transfer_token" => TxType::TransferToken,
+        "deploy_contract" => TxType::DeployContract,
+        "call_contract" => TxType::CallContract,
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ 
             "success": false,
             "error": "invalid_tx_type",
-            "message": format!("Invalid transaction type: {}. Valid types: transfer, deploy, call, create_token, transfer_token", req.tx_type)
+            "message": format!("Invalid transaction type: {}. Valid types: transfer, create_token, transfer_token, deploy_contract, call_contract", req.tx_type)
         }))).into_response(),
     };
 
@@ -707,6 +979,103 @@ async fn submit_transaction(
                 }
                 
                 Some(TxData::Call { contract, method, args })
+            }
+            TxType::DeployContract => {
+                let name = d["name"].as_str().unwrap_or("").to_string();
+                let token = d["token"].as_str().map(|s| s.to_string());
+                
+                // Parse variables
+                let variables: Vec<crate::mvm::VarDef> = d["variables"].as_array()
+                    .map(|arr| {
+                        arr.iter().filter_map(|v| {
+                            let name = v["name"].as_str()?.to_string();
+                            let var_type = crate::mvm::VarType::from_str(v["type"].as_str()?)?;
+                            let default = v["default"].as_str().map(|s| s.to_string());
+                            Some(crate::mvm::VarDef { name, var_type, default })
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+                
+                // Parse mappings
+                let mappings: Vec<crate::mvm::MappingDef> = d["mappings"].as_array()
+                    .map(|arr| {
+                        arr.iter().filter_map(|m| {
+                            let name = m["name"].as_str()?.to_string();
+                            let key_type = crate::mvm::VarType::from_str(m["key_type"].as_str()?)?;
+                            let value_type = crate::mvm::VarType::from_str(m["value_type"].as_str()?)?;
+                            Some(crate::mvm::MappingDef { name, key_type, value_type })
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+                
+                // Parse functions
+                let functions: Vec<crate::mvm::FnDef> = d["functions"].as_array()
+                    .map(|arr| {
+                        arr.iter().filter_map(|f| {
+                            let name = f["name"].as_str()?.to_string();
+                            let modifiers: Vec<crate::mvm::FnModifier> = f["modifiers"].as_array()
+                                .map(|mods| {
+                                    mods.iter().filter_map(|m| {
+                                        match m.as_str()?.to_lowercase().as_str() {
+                                            "view" => Some(crate::mvm::FnModifier::View),
+                                            "write" => Some(crate::mvm::FnModifier::Write),
+                                            "payable" => Some(crate::mvm::FnModifier::Payable),
+                                            "onlyowner" | "only_owner" => Some(crate::mvm::FnModifier::OnlyOwner),
+                                            _ => None,
+                                        }
+                                    }).collect()
+                                })
+                                .unwrap_or_default();
+                            let args: Vec<crate::mvm::FnArg> = f["args"].as_array()
+                                .map(|args| {
+                                    args.iter().filter_map(|a| {
+                                        let name = a["name"].as_str()?.to_string();
+                                        let arg_type = crate::mvm::VarType::from_str(a["type"].as_str()?)?;
+                                        Some(crate::mvm::FnArg { name, arg_type })
+                                    }).collect()
+                                })
+                                .unwrap_or_default();
+                            let body: Vec<crate::mvm::Operation> = f["body"].as_array()
+                                .map(|ops| {
+                                    ops.iter().filter_map(|op| {
+                                        serde_json::from_value(op.clone()).ok()
+                                    }).collect()
+                                })
+                                .unwrap_or_default();
+                            let returns = f["returns"].as_str()
+                                .and_then(|s| crate::mvm::VarType::from_str(s));
+                            Some(crate::mvm::FnDef { name, modifiers, args, body, returns })
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+                
+                if name.is_empty() {
+                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "success": false,
+                        "error": "invalid_data",
+                        "message": "Contract name is required"
+                    }))).into_response();
+                }
+                
+                Some(TxData::DeployContract { name, token, variables, mappings, functions })
+            }
+            TxType::CallContract => {
+                let contract = d["contract"].as_str().unwrap_or("").to_string();
+                let method = d["method"].as_str().unwrap_or("").to_string();
+                let args = d["args"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let amount = d["amount"].as_u64();
+                
+                if contract.is_empty() || method.is_empty() {
+                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "success": false,
+                        "error": "invalid_data",
+                        "message": "Contract address and method name are required"
+                    }))).into_response();
+                }
+                
+                Some(TxData::CallContract { contract, method, args, amount })
             }
             TxType::Transfer => {
                 if req.to.is_none() {

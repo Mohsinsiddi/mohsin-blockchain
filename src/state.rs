@@ -189,6 +189,124 @@ impl State {
         }
     }
 
+    // Contract variables (alias for storage)
+    pub fn set_contract_var(&mut self, contract: &str, var_name: &str, value: &str) -> Result<(), BoxError> {
+        self.set_contract_storage(contract, var_name, value)
+    }
+
+    pub fn get_contract_var(&self, contract: &str, var_name: &str) -> Result<Option<String>, BoxError> {
+        self.get_contract_storage(contract, var_name)
+    }
+
+    // ==================== MOSH CONTRACTS ====================
+
+    pub fn save_mosh_contract(&mut self, contract: &crate::mvm::MoshContract) -> Result<(), BoxError> {
+        let key = format!("mosh:{}", contract.address);
+        let value = serde_json::to_string(contract)?;
+        self.db.put(key.as_bytes(), value.as_bytes())?;
+        
+        let creator_key = format!("mosh_by_creator:{}:{}", contract.creator, contract.address);
+        self.db.put(creator_key.as_bytes(), b"1")?;
+        
+        Ok(())
+    }
+
+    pub fn get_mosh_contract(&self, address: &str) -> Result<Option<crate::mvm::MoshContract>, BoxError> {
+        let key = format!("mosh:{}", address);
+        if let Some(bytes) = self.db.get(key.as_bytes())? {
+            let contract: crate::mvm::MoshContract = serde_json::from_slice(&bytes)?;
+            Ok(Some(contract))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_all_mosh_contracts(&self) -> Result<Vec<crate::mvm::MoshContract>, BoxError> {
+        let mut contracts = Vec::new();
+        let prefix = b"mosh:mvm1contract";
+        
+        let iter = self.db.prefix_iterator(prefix);
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if key_str.starts_with("mosh:mvm1contract") {
+                let contract: crate::mvm::MoshContract = serde_json::from_slice(&value)?;
+                contracts.push(contract);
+            }
+        }
+        
+        Ok(contracts)
+    }
+
+    pub fn get_mosh_contracts_by_creator(&self, creator: &str) -> Result<Vec<crate::mvm::MoshContract>, BoxError> {
+        let mut contracts = Vec::new();
+        let prefix = format!("mosh_by_creator:{}:", creator);
+        
+        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        for item in iter {
+            let (key, _) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if let Some(addr) = key_str.strip_prefix(&prefix) {
+                if let Some(contract) = self.get_mosh_contract(addr)? {
+                    contracts.push(contract);
+                }
+            }
+        }
+        
+        Ok(contracts)
+    }
+
+    // ==================== MOSH VARIABLES ====================
+
+    pub fn set_mosh_var(&mut self, contract: &str, var: &str, value: &str) -> Result<(), BoxError> {
+        let key = format!("mosh_var:{}:{}", contract, var);
+        self.db.put(key.as_bytes(), value.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn get_mosh_var(&self, contract: &str, var: &str) -> Result<Option<String>, BoxError> {
+        let key = format!("mosh_var:{}:{}", contract, var);
+        if let Some(bytes) = self.db.get(key.as_bytes())? {
+            Ok(Some(String::from_utf8(bytes.to_vec())?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ==================== MOSH MAPPINGS ====================
+
+    pub fn set_mosh_map(&mut self, contract: &str, map: &str, key: &str, value: &str) -> Result<(), BoxError> {
+        let db_key = format!("mosh_map:{}:{}:{}", contract, map, key);
+        self.db.put(db_key.as_bytes(), value.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn get_mosh_map(&self, contract: &str, map: &str, key: &str) -> Result<Option<String>, BoxError> {
+        let db_key = format!("mosh_map:{}:{}:{}", contract, map, key);
+        if let Some(bytes) = self.db.get(db_key.as_bytes())? {
+            Ok(Some(String::from_utf8(bytes.to_vec())?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_all_mosh_map_entries(&self, contract: &str, map: &str) -> Result<Vec<(String, String)>, BoxError> {
+        let mut entries = Vec::new();
+        let prefix = format!("mosh_map:{}:{}:", contract, map);
+        
+        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if let Some(map_key) = key_str.strip_prefix(&prefix) {
+                let val = String::from_utf8(value.to_vec())?;
+                entries.push((map_key.to_string(), val));
+            }
+        }
+        
+        Ok(entries)
+    }
+
     // Token operations (MVM-20)
     pub fn save_token(&mut self, token: &MVM20Token) -> Result<(), BoxError> {
         let key = format!("token:{}", token.address);
