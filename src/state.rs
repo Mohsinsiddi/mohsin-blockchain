@@ -50,6 +50,7 @@ impl State {
         self.keypair.as_ref()
     }
 
+    // Block operations
     pub fn save_block(&mut self, block: &Block) -> Result<(), BoxError> {
         let key = format!("block:{}", block.height);
         let value = serde_json::to_string(block)?;
@@ -93,6 +94,7 @@ impl State {
         }
     }
 
+    // Height operations
     pub fn set_height(&mut self, height: u64) -> Result<(), BoxError> {
         self.db.put(b"meta:height", height.to_le_bytes())?;
         Ok(())
@@ -109,6 +111,7 @@ impl State {
         }
     }
 
+    // Balance operations
     pub fn set_balance(&mut self, address: &str, balance: u64) -> Result<(), BoxError> {
         let key = format!("balance:{}", address);
         self.db.put(key.as_bytes(), balance.to_le_bytes())?;
@@ -127,6 +130,33 @@ impl State {
         }
     }
 
+    // Nonce operations
+    pub fn set_nonce(&mut self, address: &str, nonce: u64) -> Result<(), BoxError> {
+        let key = format!("nonce:{}", address);
+        self.db.put(key.as_bytes(), nonce.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub fn get_nonce(&self, address: &str) -> Result<u64, BoxError> {
+        let key = format!("nonce:{}", address);
+        if let Some(bytes) = self.db.get(key.as_bytes())? {
+            Ok(u64::from_le_bytes(
+                bytes.as_slice().try_into()
+                    .map_err(|_| BoxError::from("Invalid nonce bytes"))?
+            ))
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn increment_nonce(&mut self, address: &str) -> Result<u64, BoxError> {
+        let current = self.get_nonce(address)?;
+        let new_nonce = current + 1;
+        self.set_nonce(address, new_nonce)?;
+        Ok(new_nonce)
+    }
+
+    // Total supply
     pub fn set_total_supply(&mut self, supply: u64) -> Result<(), BoxError> {
         self.db.put(b"meta:total_supply", supply.to_le_bytes())?;
         Ok(())
@@ -143,6 +173,7 @@ impl State {
         }
     }
 
+    // Contract storage
     pub fn set_contract_storage(&mut self, contract: &str, key: &str, value: &str) -> Result<(), BoxError> {
         let storage_key = format!("storage:{}:{}", contract, key);
         self.db.put(storage_key.as_bytes(), value.as_bytes())?;
@@ -158,6 +189,7 @@ impl State {
         }
     }
 
+    // Token operations (MVM-20)
     pub fn save_token(&mut self, token: &MVM20Token) -> Result<(), BoxError> {
         let key = format!("token:{}", token.address);
         let value = serde_json::to_string(token)?;
@@ -214,21 +246,7 @@ impl State {
         }
     }
 
-    pub fn save_node(&mut self, node_id: &str, data: &str) -> Result<(), BoxError> {
-        let key = format!("node:{}", node_id);
-        self.db.put(key.as_bytes(), data.as_bytes())?;
-        Ok(())
-    }
-
-    pub fn get_node(&self, node_id: &str) -> Result<Option<String>, BoxError> {
-        let key = format!("node:{}", node_id);
-        if let Some(bytes) = self.db.get(key.as_bytes())? {
-            Ok(Some(String::from_utf8(bytes.to_vec())?))
-        } else {
-            Ok(None)
-        }
-    }
-
+    // Faucet operations
     pub fn get_faucet_claim(&self, address: &str) -> Result<Option<i64>, BoxError> {
         let key = format!("faucet:{}", address);
         if let Some(bytes) = self.db.get(key.as_bytes())? {
@@ -247,6 +265,7 @@ impl State {
         Ok(())
     }
 
+    // State snapshot for sync
     pub fn get_state_snapshot(&self) -> Result<StateSnapshot, BoxError> {
         let height = self.get_height()?;
         let total_supply = self.get_total_supply()?;
