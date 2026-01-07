@@ -5,7 +5,7 @@ use crate::network::{Network, StarNetwork};
 use crate::address::{Address, hash_tx_data, verify_tx_signature};
 
 use axum::{
-    extract::{Path, State as AxumState, WebSocketUpgrade, ws::{WebSocket, Message}},
+    extract::{Path, Query, State as AxumState, WebSocketUpgrade, ws::{WebSocket, Message}},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -46,7 +46,9 @@ pub async fn start_api_server(
         .route("/status", get(get_status))
         .route("/block/:height", get(get_block))
         .route("/block/latest", get(get_latest_block))
+        .route("/blocks", get(get_blocks))
         .route("/tx/:hash", get(get_transaction))
+        .route("/txs", get(get_recent_transactions))
         .route("/balance/:address", get(get_balance))
         .route("/nonce/:address", get(get_nonce))
         .route("/account/:address", get(get_account))
@@ -62,7 +64,11 @@ pub async fn start_api_server(
         .route("/contracts", get(get_contracts))
         .route("/contracts/creator/:address", get(get_contracts_by_creator))
         .route("/contract/:address", get(get_contract))
+        .route("/contract/:address/mbi", get(get_contract_mbi))
+        .route("/contract/:address/var/:name", get(read_contract_var))
         .route("/contract/:address/mapping/:name", get(get_contract_mapping))
+        .route("/contract/:address/mapping/:name/:key", get(read_contract_mapping))
+        .route("/contract/:address/call/:method", get(call_contract_view))
         .route("/wallet/new", get(create_wallet))
         .route("/ws", get(ws_handler))
         .route("/p2p", get(p2p_handler))
@@ -83,45 +89,50 @@ async fn index() -> impl IntoResponse {
         "version": "0.3.0",
         "language": "Mosh",
         "endpoints": {
-            "status": "GET /status",
-            "block": "GET /block/:height",
-            "latest_block": "GET /block/latest",
-            "transaction": "GET /tx/:hash",
-            "balance": "GET /balance/:address",
-            "nonce": "GET /nonce/:address",
-            "account": "GET /account/:address",
-            "address_txs": "GET /txs/:address",
-            "faucet": "POST /faucet/:address",
-            "submit_tx": "POST /tx",
-            "sign_tx": "POST /tx/sign",
-            "tokens": "GET /tokens",
-            "tokens_by_creator": "GET /tokens/creator/:address",
-            "tokens_by_holder": "GET /tokens/holder/:address",
-            "token_info": "GET /token/:address",
-            "token_balance": "GET /token/:contract/balance/:address",
-            "contracts": "GET /contracts",
-            "contracts_by_creator": "GET /contracts/creator/:address",
-            "contract_info": "GET /contract/:address",
-            "contract_mapping": "GET /contract/:address/mapping/:name",
-            "create_wallet": "GET /wallet/new",
-            "websocket": "WS /ws",
-            "p2p": "WS /p2p"
-        },
-        "tx_types": [
-            "transfer",
-            "create_token",
-            "transfer_token",
-            "deploy_contract",
-            "call_contract"
-        ],
-        "contract_features": {
-            "variables": ["uint64", "string", "bool", "address"],
-            "mappings": "mapping(key_type => value_type)",
-            "functions": {
-                "modifiers": ["view", "write", "payable", "onlyOwner"],
-                "operations": ["set", "add", "sub", "map_set", "map_add", "map_sub", "require", "transfer", "return", "let"]
+            "chain": {
+                "status": "GET /status",
+                "blocks": "GET /blocks?limit=10",
+                "block": "GET /block/:height",
+                "latest": "GET /block/latest",
+                "txs": "GET /txs?limit=20",
+                "tx": "GET /tx/:hash"
             },
-            "auto_methods": ["get_<var>", "set_<var>", "get_owner", "set_owner"]
+            "accounts": {
+                "balance": "GET /balance/:address",
+                "nonce": "GET /nonce/:address",
+                "account": "GET /account/:address",
+                "txs": "GET /txs/:address",
+                "wallet": "GET /wallet/new",
+                "faucet": "POST /faucet/:address"
+            },
+            "tokens": {
+                "all": "GET /tokens",
+                "by_creator": "GET /tokens/creator/:address",
+                "by_holder": "GET /tokens/holder/:address",
+                "info": "GET /token/:address",
+                "balance": "GET /token/:contract/balance/:address"
+            },
+            "contracts_read_FREE": {
+                "all": "GET /contracts",
+                "by_creator": "GET /contracts/creator/:address",
+                "info": "GET /contract/:address",
+                "mbi": "GET /contract/:address/mbi",
+                "var": "GET /contract/:address/var/:name",
+                "mapping_all": "GET /contract/:address/mapping/:name",
+                "mapping_key": "GET /contract/:address/mapping/:name/:key",
+                "call_view": "GET /contract/:address/call/:method?args=a,b,c"
+            },
+            "transactions_write": {
+                "sign": "POST /tx/sign",
+                "submit": "POST /tx"
+            }
+        },
+        "tx_types": ["transfer", "create_token", "transfer_token", "deploy_contract", "call_contract"],
+        "mosh": {
+            "types": ["uint64", "string", "bool", "address"],
+            "mappings": "mapping(key => value)",
+            "modifiers": ["view (FREE)", "write", "payable", "onlyOwner"],
+            "operations": ["set", "add", "sub", "map_set", "map_add", "map_sub", "require", "transfer", "return", "let"]
         }
     }))
 }
@@ -650,6 +661,554 @@ async fn get_contract_mapping(
             "message": e.to_string()
         }))).into_response(),
     }
+}
+
+// ===== FREE READ ENDPOINT (No gas, no signature) =====
+
+#[derive(Deserialize)]
+struct ReadQuery {
+    args: Option<String>,  // Comma-separated args
+}
+
+async fn read_contract(
+    Path((address, method)): Path<(String, String)>,
+    Query(query): Query<ReadQuery>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    
+    // Get contract
+    let contract = match state_guard.get_mosh_contract(&address) {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "contract_not_found",
+            "message": format!("Contract not found: {}", address)
+        }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": "internal_error",
+            "message": e.to_string()
+        }))).into_response(),
+    };
+    
+    // Parse args
+    let args: Vec<String> = query.args
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+    
+    // ========== CHECK USER FUNCTION FIRST (View only) ==========
+    if let Some(func) = contract.functions.iter().find(|f| f.name == method) {
+        // Only allow View functions for free reads
+        if !func.modifiers.contains(&crate::mvm::FnModifier::View) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": "not_view_function",
+                "message": format!("Function '{}' is not a view function. Use /tx endpoint.", method),
+                "modifiers": func.modifiers.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>()
+            }))).into_response();
+        }
+        
+        // Execute view function - simple implementation for common patterns
+        // For now, handle simple return operations
+        for op in &func.body {
+            if op.op == "return" {
+                if let Some(ref val) = op.value {
+                    if let Some(s) = val.as_str() {
+                        // Check if it's a mapping access: mapname[key]
+                        if s.contains('[') && s.ends_with(']') {
+                            let parts: Vec<&str> = s.trim_end_matches(']').split('[').collect();
+                            if parts.len() == 2 {
+                                let map_name = parts[0];
+                                let key_expr = parts[1];
+                                
+                                // Resolve key - could be an arg name
+                                let key = if let Some(arg_idx) = func.args.iter().position(|a| a.name == key_expr) {
+                                    args.get(arg_idx).cloned().unwrap_or_default()
+                                } else {
+                                    key_expr.to_string()
+                                };
+                                
+                                let result = state_guard.get_mosh_map(&address, map_name, &key)
+                                    .unwrap_or(None)
+                                    .unwrap_or("0".to_string());
+                                
+                                // Try to parse as number
+                                let typed = if let Ok(n) = result.parse::<u64>() {
+                                    serde_json::json!(n)
+                                } else if result == "true" || result == "false" {
+                                    serde_json::json!(result == "true")
+                                } else {
+                                    serde_json::json!(result)
+                                };
+                                
+                                return Json(serde_json::json!({
+                                    "success": true,
+                                    "method": method,
+                                    "result": typed,
+                                    "gas": 0
+                                })).into_response();
+                            }
+                        }
+                        
+                        // Check if it's a variable
+                        if contract.variables.iter().any(|v| v.name == s) {
+                            let result = state_guard.get_mosh_var(&address, s)
+                                .unwrap_or(None)
+                                .unwrap_or("0".to_string());
+                            let typed = if let Ok(n) = result.parse::<u64>() {
+                                serde_json::json!(n)
+                            } else {
+                                serde_json::json!(result)
+                            };
+                            return Json(serde_json::json!({
+                                "success": true,
+                                "method": method,
+                                "result": typed,
+                                "gas": 0
+                            })).into_response();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Default response for view functions
+        return Json(serde_json::json!({
+            "success": true,
+            "method": method,
+            "result": null,
+            "gas": 0
+        })).into_response();
+    }
+    
+    // ========== HANDLE AUTO GETTERS ==========
+    if method.starts_with("get_") {
+        let var_name = &method[4..];
+        
+        // Reserved getters
+        match var_name {
+            "owner" => return Json(serde_json::json!({
+                "success": true, "method": method, "result": contract.owner, "gas": 0
+            })).into_response(),
+            "creator" => return Json(serde_json::json!({
+                "success": true, "method": method, "result": contract.creator, "gas": 0
+            })).into_response(),
+            "token" => return Json(serde_json::json!({
+                "success": true, "method": method, "result": contract.token, "gas": 0
+            })).into_response(),
+            "address" => return Json(serde_json::json!({
+                "success": true, "method": method, "result": contract.address, "gas": 0
+            })).into_response(),
+            _ => {}
+        }
+        
+        // User variable
+        if let Some(v) = contract.variables.iter().find(|x| x.name == var_name) {
+            let val = state_guard.get_mosh_var(&address, var_name)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let typed = match v.var_type {
+                crate::mvm::VarType::Uint64 => serde_json::json!(val.parse::<u64>().unwrap_or(0)),
+                crate::mvm::VarType::Bool => serde_json::json!(val == "true"),
+                _ => serde_json::json!(val),
+            };
+            return Json(serde_json::json!({
+                "success": true, "method": method, "result": typed, "gas": 0
+            })).into_response();
+        }
+        
+        // Mapping getter
+        if let Some(m) = contract.mappings.iter().find(|x| x.name == var_name) {
+            if args.is_empty() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "success": false,
+                    "error": "missing_key",
+                    "message": "Mapping getter requires key argument: ?args=<key>"
+                }))).into_response();
+            }
+            let val = state_guard.get_mosh_map(&address, var_name, &args[0])
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let typed = match m.value_type {
+                crate::mvm::VarType::Uint64 => serde_json::json!(val.parse::<u64>().unwrap_or(0)),
+                crate::mvm::VarType::Bool => serde_json::json!(val == "true"),
+                _ => serde_json::json!(val),
+            };
+            return Json(serde_json::json!({
+                "success": true, 
+                "method": method, 
+                "key": &args[0],
+                "result": typed, 
+                "gas": 0
+            })).into_response();
+        }
+        
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "unknown_getter",
+            "message": format!("Unknown getter: {}", method)
+        }))).into_response();
+    }
+    
+    // Setters not allowed (write functions)
+    if method.starts_with("set_") {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "write_function",
+            "message": "Setters require a signed transaction. Use /tx endpoint."
+        }))).into_response();
+    }
+    
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({
+        "success": false,
+        "error": "unknown_method",
+        "message": format!("Unknown method: {}", method)
+    }))).into_response()
+}
+
+// Alias for read_contract
+async fn call_contract_view(
+    path: Path<(String, String)>,
+    query: Query<ReadQuery>,
+    state: AxumState<SharedState>,
+) -> impl IntoResponse {
+    read_contract(path, query, state).await
+}
+
+// ===== MBI (Mosh Binary Interface) =====
+
+async fn get_contract_mbi(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    
+    match state_guard.get_mosh_contract(&address) {
+        Ok(Some(c)) => {
+            // Build getters array
+            let mut getters = Vec::new();
+            for v in &c.variables {
+                getters.push(serde_json::json!({
+                    "method": format!("get_{}", v.name),
+                    "returns": format!("{:?}", v.var_type),
+                    "free": true,
+                    "call": format!("GET /contract/{}/call/get_{}", c.address, v.name)
+                }));
+            }
+            for m in &c.mappings {
+                getters.push(serde_json::json!({
+                    "method": format!("get_{}", m.name),
+                    "args": [{"name": "key", "type": format!("{:?}", m.key_type)}],
+                    "returns": format!("{:?}", m.value_type),
+                    "free": true,
+                    "call": format!("GET /contract/{}/call/get_{}?args={{key}}", c.address, m.name)
+                }));
+            }
+            for name in &["owner", "creator", "token", "address"] {
+                getters.push(serde_json::json!({
+                    "method": format!("get_{}", name),
+                    "returns": if *name == "token" { "Option<String>" } else { "String" },
+                    "free": true,
+                    "call": format!("GET /contract/{}/call/get_{}", c.address, name)
+                }));
+            }
+            
+            // Build setters array
+            let mut setters = Vec::new();
+            for v in &c.variables {
+                setters.push(serde_json::json!({
+                    "method": format!("set_{}", v.name),
+                    "args": [{"name": "value", "type": format!("{:?}", v.var_type)}],
+                    "owner_only": true,
+                    "call": "POST /tx call_contract"
+                }));
+            }
+            for m in &c.mappings {
+                setters.push(serde_json::json!({
+                    "method": format!("set_{}", m.name),
+                    "args": [
+                        {"name": "key", "type": format!("{:?}", m.key_type)},
+                        {"name": "value", "type": format!("{:?}", m.value_type)}
+                    ],
+                    "owner_only": true,
+                    "call": "POST /tx call_contract"
+                }));
+            }
+            setters.push(serde_json::json!({
+                "method": "set_owner",
+                "args": [{"name": "new_owner", "type": "Address"}],
+                "owner_only": true,
+                "call": "POST /tx call_contract"
+            }));
+            
+            // Build variables array
+            let variables: Vec<serde_json::Value> = c.variables.iter().map(|v| serde_json::json!({
+                "name": v.name,
+                "type": format!("{:?}", v.var_type),
+                "read": format!("GET /contract/{}/var/{}", c.address, v.name),
+                "write": format!("POST /tx call_contract set_{}", v.name)
+            })).collect();
+            
+            // Build mappings array
+            let mappings: Vec<serde_json::Value> = c.mappings.iter().map(|m| serde_json::json!({
+                "name": m.name,
+                "key_type": format!("{:?}", m.key_type),
+                "value_type": format!("{:?}", m.value_type),
+                "read": format!("GET /contract/{}/mapping/{}/{{key}}", c.address, m.name),
+                "read_all": format!("GET /contract/{}/mapping/{}", c.address, m.name),
+                "write": format!("POST /tx call_contract set_{}", m.name)
+            })).collect();
+            
+            // Build functions array
+            let functions: Vec<serde_json::Value> = c.functions.iter().map(|f| {
+                let is_view = f.modifiers.contains(&crate::mvm::FnModifier::View);
+                let is_payable = f.modifiers.contains(&crate::mvm::FnModifier::Payable);
+                let args: Vec<serde_json::Value> = f.args.iter().map(|a| serde_json::json!({
+                    "name": a.name,
+                    "type": format!("{:?}", a.arg_type)
+                })).collect();
+                let modifiers: Vec<String> = f.modifiers.iter().map(|m| format!("{:?}", m)).collect();
+                serde_json::json!({
+                    "name": f.name,
+                    "modifiers": modifiers,
+                    "args": args,
+                    "returns": f.returns.as_ref().map(|r| format!("{:?}", r)),
+                    "free": is_view,
+                    "payable": is_payable,
+                    "call": if is_view {
+                        format!("GET /contract/{}/call/{}?args=...", c.address, f.name)
+                    } else {
+                        format!("POST /tx call_contract {}", f.name)
+                    }
+                })
+            }).collect();
+            
+            // Build MBI
+            let mbi = serde_json::json!({
+                "name": c.name,
+                "address": c.address,
+                "owner": c.owner,
+                "token": c.token,
+                "variables": variables,
+                "mappings": mappings,
+                "functions": functions,
+                "auto_getters": getters,
+                "auto_setters": setters
+            });
+            
+            Json(serde_json::json!({
+                "success": true,
+                "mbi": mbi
+            })).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "contract_not_found"
+        }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string()
+        }))).into_response(),
+    }
+}
+
+// ===== Direct Variable Read =====
+
+async fn read_contract_var(
+    Path((address, var_name)): Path<(String, String)>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    
+    let contract = match state_guard.get_mosh_contract(&address) {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "contract_not_found"
+        }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string()
+        }))).into_response(),
+    };
+    
+    // Reserved variables
+    match var_name.as_str() {
+        "owner" => return Json(serde_json::json!({
+            "success": true, "variable": "owner", "value": contract.owner, "type": "Address"
+        })).into_response(),
+        "creator" => return Json(serde_json::json!({
+            "success": true, "variable": "creator", "value": contract.creator, "type": "Address"
+        })).into_response(),
+        "token" => return Json(serde_json::json!({
+            "success": true, "variable": "token", "value": contract.token, "type": "Option<Address>"
+        })).into_response(),
+        "address" => return Json(serde_json::json!({
+            "success": true, "variable": "address", "value": contract.address, "type": "Address"
+        })).into_response(),
+        "name" => return Json(serde_json::json!({
+            "success": true, "variable": "name", "value": contract.name, "type": "String"
+        })).into_response(),
+        _ => {}
+    }
+    
+    // User variable
+    if let Some(v) = contract.variables.iter().find(|x| x.name == var_name) {
+        let val = state_guard.get_mosh_var(&address, &var_name)
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let typed = match v.var_type {
+            crate::mvm::VarType::Uint64 => serde_json::json!(val.parse::<u64>().unwrap_or(0)),
+            crate::mvm::VarType::Bool => serde_json::json!(val == "true"),
+            _ => serde_json::json!(val),
+        };
+        return Json(serde_json::json!({
+            "success": true,
+            "variable": var_name,
+            "value": typed,
+            "type": format!("{:?}", v.var_type)
+        })).into_response();
+    }
+    
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({
+        "success": false,
+        "error": "variable_not_found",
+        "message": format!("Variable '{}' not found", var_name)
+    }))).into_response()
+}
+
+// ===== Direct Mapping Read =====
+
+async fn read_contract_mapping(
+    Path((address, map_name, key)): Path<(String, String, String)>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    
+    let contract = match state_guard.get_mosh_contract(&address) {
+        Ok(Some(c)) => c,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "contract_not_found"
+        }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string()
+        }))).into_response(),
+    };
+    
+    // Find mapping
+    let mapping = match contract.mappings.iter().find(|m| m.name == map_name) {
+        Some(m) => m,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "mapping_not_found",
+            "message": format!("Mapping '{}' not found", map_name)
+        }))).into_response(),
+    };
+    
+    let val = state_guard.get_mosh_map(&address, &map_name, &key)
+        .unwrap_or(None)
+        .unwrap_or_default();
+    
+    let typed = match mapping.value_type {
+        crate::mvm::VarType::Uint64 => serde_json::json!(val.parse::<u64>().unwrap_or(0)),
+        crate::mvm::VarType::Bool => serde_json::json!(val == "true"),
+        _ => serde_json::json!(val),
+    };
+    
+    Json(serde_json::json!({
+        "success": true,
+        "mapping": map_name,
+        "key": key,
+        "value": typed,
+        "value_type": format!("{:?}", mapping.value_type)
+    })).into_response()
+}
+
+// ===== Get Blocks =====
+
+async fn get_blocks(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let limit: usize = params.get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+        .min(100);
+    
+    let state_guard = state.state.read().await;
+    let height = state_guard.get_height().unwrap_or(0);
+    
+    let mut blocks = Vec::new();
+    let start = if height > limit as u64 { height - limit as u64 + 1 } else { 1 };
+    
+    for h in (start..=height).rev() {
+        if let Ok(Some(block)) = state_guard.get_block(h) {
+            blocks.push(serde_json::json!({
+                "height": block.height,
+                "hash": block.hash,
+                "timestamp": block.timestamp,
+                "transactions": block.transactions.len(),
+                "validator": block.validator
+            }));
+        }
+    }
+    
+    Json(serde_json::json!({
+        "success": true,
+        "height": height,
+        "count": blocks.len(),
+        "blocks": blocks
+    }))
+}
+
+// ===== Get Recent Transactions =====
+
+async fn get_recent_transactions(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let limit: usize = params.get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20)
+        .min(100);
+    
+    let state_guard = state.state.read().await;
+    let height = state_guard.get_height().unwrap_or(0);
+    
+    let mut txs = Vec::new();
+    
+    // Go through recent blocks
+    for h in (1..=height).rev() {
+        if txs.len() >= limit {
+            break;
+        }
+        if let Ok(Some(block)) = state_guard.get_block(h) {
+            for tx in &block.transactions {
+                if txs.len() >= limit {
+                    break;
+                }
+                txs.push(serde_json::json!({
+                    "hash": tx.hash,
+                    "type": tx.tx_type.as_str(),
+                    "from": tx.from,
+                    "to": tx.to,
+                    "value": tx.value,
+                    "status": format!("{:?}", tx.status),
+                    "block": h,
+                    "timestamp": tx.timestamp
+                }));
+            }
+        }
+    }
+    
+    Json(serde_json::json!({
+        "success": true,
+        "count": txs.len(),
+        "transactions": txs
+    }))
 }
 
 async fn create_wallet() -> impl IntoResponse {
