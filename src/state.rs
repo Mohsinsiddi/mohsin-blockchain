@@ -265,6 +265,105 @@ impl State {
         Ok(())
     }
 
+    // Transaction operations
+    pub fn get_transaction(&self, hash: &str) -> Result<Option<crate::chain::Transaction>, BoxError> {
+        let key = format!("tx:{}", hash);
+        if let Some(bytes) = self.db.get(key.as_bytes())? {
+            let tx: crate::chain::Transaction = serde_json::from_slice(&bytes)?;
+            Ok(Some(tx))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn index_transaction(&mut self, tx: &crate::chain::Transaction, block_height: u64) -> Result<(), BoxError> {
+        // Index by sender
+        let from_key = format!("tx_by_addr:{}:{}", tx.from, tx.hash);
+        self.db.put(from_key.as_bytes(), block_height.to_le_bytes())?;
+        
+        // Index by recipient if exists
+        if let Some(ref to) = tx.to {
+            let to_key = format!("tx_by_addr:{}:{}", to, tx.hash);
+            self.db.put(to_key.as_bytes(), block_height.to_le_bytes())?;
+        }
+        
+        Ok(())
+    }
+
+    pub fn get_transactions_by_address(&self, address: &str, limit: usize) -> Result<Vec<crate::chain::Transaction>, BoxError> {
+        let mut txs = Vec::new();
+        let prefix = format!("tx_by_addr:{}:", address);
+        
+        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        for item in iter.take(limit) {
+            let (key, _) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            
+            // Extract tx hash from key
+            if let Some(tx_hash) = key_str.strip_prefix(&prefix) {
+                if let Some(tx) = self.get_transaction(tx_hash)? {
+                    txs.push(tx);
+                }
+            }
+        }
+        
+        // Sort by timestamp descending
+        txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(txs)
+    }
+
+    // Token query operations
+    pub fn get_tokens_by_creator(&self, creator: &str) -> Result<Vec<MVM20Token>, BoxError> {
+        let mut tokens = Vec::new();
+        let all_tokens = self.get_all_tokens()?;
+        
+        for token in all_tokens {
+            if token.creator == creator {
+                tokens.push(token);
+            }
+        }
+        
+        Ok(tokens)
+    }
+
+    pub fn get_token_holdings(&self, address: &str) -> Result<Vec<TokenHolding>, BoxError> {
+        let mut holdings = Vec::new();
+        let prefix = b"token_balance:";
+        
+        let iter = self.db.prefix_iterator(prefix);
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            
+            // Key format: token_balance:CONTRACT:ADDRESS
+            if let Some(rest) = key_str.strip_prefix("token_balance:") {
+                let parts: Vec<&str> = rest.split(':').collect();
+                if parts.len() == 2 && parts[1] == address {
+                    let contract = parts[0].to_string();
+                    let balance = u64::from_le_bytes(
+                        value.as_ref().try_into()
+                            .map_err(|_| BoxError::from("Invalid balance bytes"))?
+                    );
+                    
+                    if balance > 0 {
+                        // Get token info
+                        if let Some(token) = self.get_token(&contract)? {
+                            holdings.push(TokenHolding {
+                                contract: contract.clone(),
+                                name: token.name,
+                                symbol: token.symbol,
+                                balance,
+                                decimals: token.decimals,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(holdings)
+    }
+
     // State snapshot for sync
     pub fn get_state_snapshot(&self) -> Result<StateSnapshot, BoxError> {
         let height = self.get_height()?;
@@ -308,4 +407,13 @@ pub struct StateSnapshot {
     pub total_supply: u64,
     pub balances: std::collections::HashMap<String, u64>,
     pub recent_blocks: Vec<Block>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenHolding {
+    pub contract: String,
+    pub name: String,
+    pub symbol: String,
+    pub balance: u64,
+    pub decimals: u8,
 }

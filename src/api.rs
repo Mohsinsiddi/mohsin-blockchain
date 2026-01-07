@@ -49,10 +49,14 @@ pub async fn start_api_server(
         .route("/tx/:hash", get(get_transaction))
         .route("/balance/:address", get(get_balance))
         .route("/nonce/:address", get(get_nonce))
+        .route("/account/:address", get(get_account))
+        .route("/txs/:address", get(get_address_transactions))
         .route("/faucet/:address", post(faucet))
         .route("/tx", post(submit_transaction))
         .route("/tx/sign", post(sign_transaction))
         .route("/tokens", get(get_tokens))
+        .route("/tokens/creator/:address", get(get_tokens_by_creator))
+        .route("/tokens/holder/:address", get(get_token_holdings))
         .route("/token/:address", get(get_token))
         .route("/token/:contract/balance/:address", get(get_token_balance))
         .route("/wallet/new", get(create_wallet))
@@ -80,10 +84,14 @@ async fn index() -> impl IntoResponse {
             "transaction": "GET /tx/:hash",
             "balance": "GET /balance/:address",
             "nonce": "GET /nonce/:address",
+            "account": "GET /account/:address",
+            "address_txs": "GET /txs/:address",
             "faucet": "POST /faucet/:address",
             "submit_tx": "POST /tx",
             "sign_tx": "POST /tx/sign",
             "tokens": "GET /tokens",
+            "tokens_by_creator": "GET /tokens/creator/:address",
+            "tokens_by_holder": "GET /tokens/holder/:address",
             "token_info": "GET /token/:address",
             "token_balance": "GET /token/:contract/balance/:address",
             "create_wallet": "GET /wallet/new",
@@ -169,14 +177,48 @@ async fn get_latest_block(
 }
 
 async fn get_transaction(
-    Path(_hash): Path<String>,
-    AxumState(_state): AxumState<SharedState>,
+    Path(hash): Path<String>,
+    AxumState(state): AxumState<SharedState>,
 ) -> impl IntoResponse {
-    Json(serde_json::json!({ 
-        "success": false,
-        "error": "not_implemented",
-        "message": "Transaction lookup not implemented yet" 
-    }))
+    let state_guard = state.state.read().await;
+    match state_guard.get_transaction(&hash) {
+        Ok(Some(tx)) => {
+            let fee_paid = tx.gas_used * tx.gas_price;
+            Json(serde_json::json!({ 
+                "success": true,
+                "transaction": {
+                    "hash": tx.hash,
+                    "tx_type": tx.tx_type,
+                    "from": tx.from,
+                    "to": tx.to,
+                    "value": format_balance(tx.value),
+                    "value_raw": tx.value,
+                    "gas_price": tx.gas_price,
+                    "gas_limit": tx.gas_limit,
+                    "gas_used": tx.gas_used,
+                    "fee_paid": format_balance(fee_paid),
+                    "fee_paid_raw": fee_paid,
+                    "nonce": tx.nonce,
+                    "data": tx.data,
+                    "timestamp": tx.timestamp,
+                    "signature": tx.signature,
+                    "public_key": tx.public_key,
+                    "status": tx.status,
+                    "error": tx.error
+                }
+            })).into_response()
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ 
+            "success": false,
+            "error": "tx_not_found",
+            "message": format!("Transaction {} not found", hash)
+        }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ 
+            "success": false,
+            "error": "internal_error",
+            "message": e.to_string() 
+        }))).into_response(),
+    }
 }
 
 async fn get_balance(
@@ -224,6 +266,173 @@ async fn get_nonce(
         "success": true,
         "address": address,
         "nonce": nonce
+    })).into_response()
+}
+
+async fn get_account(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let addr = Address::new(&address);
+    if !addr.is_valid() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "invalid_address",
+            "message": format!("Invalid address format: {}", address)
+        }))).into_response();
+    }
+
+    let state_guard = state.state.read().await;
+    let balance = state_guard.get_balance(&address).unwrap_or(0);
+    let nonce = state_guard.get_nonce(&address).unwrap_or(0);
+    let tokens_created = state_guard.get_tokens_by_creator(&address).unwrap_or_default();
+    let token_holdings = state_guard.get_token_holdings(&address).unwrap_or_default();
+    let recent_txs = state_guard.get_transactions_by_address(&address, 20).unwrap_or_default();
+    
+    // Calculate total fees paid
+    let total_fees_paid: u64 = recent_txs.iter()
+        .filter(|tx| tx.from == address)
+        .map(|tx| tx.gas_used * tx.gas_price)
+        .sum();
+    
+    let txs_with_fees: Vec<serde_json::Value> = recent_txs.iter().map(|tx| {
+        let fee_paid = tx.gas_used * tx.gas_price;
+        serde_json::json!({
+            "hash": tx.hash,
+            "tx_type": tx.tx_type,
+            "from": tx.from,
+            "to": tx.to,
+            "value": format_balance(tx.value),
+            "value_raw": tx.value,
+            "gas_used": tx.gas_used,
+            "fee_paid": format_balance(fee_paid),
+            "fee_paid_raw": fee_paid,
+            "nonce": tx.nonce,
+            "timestamp": tx.timestamp,
+            "status": tx.status,
+            "error": tx.error
+        })
+    }).collect();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "account": {
+            "address": address,
+            "balance": format_balance(balance),
+            "balance_raw": balance,
+            "nonce": nonce,
+            "total_fees_paid": format_balance(total_fees_paid),
+            "total_fees_paid_raw": total_fees_paid,
+            "tokens_created": tokens_created.len(),
+            "tokens_held": token_holdings.len(),
+            "tx_count": recent_txs.len()
+        },
+        "tokens_created": tokens_created,
+        "token_holdings": token_holdings.iter().map(|h| serde_json::json!({
+            "contract": h.contract,
+            "name": h.name,
+            "symbol": h.symbol,
+            "balance": format_balance(h.balance),
+            "balance_raw": h.balance
+        })).collect::<Vec<_>>(),
+        "recent_transactions": txs_with_fees
+    })).into_response()
+}
+
+async fn get_address_transactions(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let addr = Address::new(&address);
+    if !addr.is_valid() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "invalid_address",
+            "message": format!("Invalid address format: {}", address)
+        }))).into_response();
+    }
+
+    let state_guard = state.state.read().await;
+    let txs = state_guard.get_transactions_by_address(&address, 100).unwrap_or_default();
+    
+    let txs_with_fees: Vec<serde_json::Value> = txs.iter().map(|tx| {
+        let fee_paid = tx.gas_used * tx.gas_price;
+        serde_json::json!({
+            "hash": tx.hash,
+            "tx_type": tx.tx_type,
+            "from": tx.from,
+            "to": tx.to,
+            "value": format_balance(tx.value),
+            "value_raw": tx.value,
+            "gas_used": tx.gas_used,
+            "fee_paid": format_balance(fee_paid),
+            "fee_paid_raw": fee_paid,
+            "nonce": tx.nonce,
+            "timestamp": tx.timestamp,
+            "status": tx.status,
+            "error": tx.error
+        })
+    }).collect();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "address": address,
+        "count": txs_with_fees.len(),
+        "transactions": txs_with_fees
+    })).into_response()
+}
+
+async fn get_tokens_by_creator(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let addr = Address::new(&address);
+    if !addr.is_valid() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "invalid_address",
+            "message": format!("Invalid address format: {}", address)
+        }))).into_response();
+    }
+
+    let state_guard = state.state.read().await;
+    let tokens = state_guard.get_tokens_by_creator(&address).unwrap_or_default();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "creator": address,
+        "count": tokens.len(),
+        "tokens": tokens
+    })).into_response()
+}
+
+async fn get_token_holdings(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let addr = Address::new(&address);
+    if !addr.is_valid() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "invalid_address",
+            "message": format!("Invalid address format: {}", address)
+        }))).into_response();
+    }
+
+    let state_guard = state.state.read().await;
+    let holdings = state_guard.get_token_holdings(&address).unwrap_or_default();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "address": address,
+        "count": holdings.len(),
+        "holdings": holdings.iter().map(|h| serde_json::json!({
+            "contract": h.contract,
+            "name": h.name,
+            "symbol": h.symbol,
+            "balance": format_balance(h.balance),
+            "balance_raw": h.balance
+        })).collect::<Vec<_>>()
     })).into_response()
 }
 

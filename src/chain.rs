@@ -336,6 +336,11 @@ impl Blockchain {
         state_guard.save_block(&block)?;
         state_guard.set_height(new_height)?;
         
+        // Index transactions for address lookup
+        for tx in &block.transactions {
+            state_guard.index_transaction(tx, new_height)?;
+        }
+        
         let current_balance = state_guard.get_balance(self.master_address.as_str())?;
         state_guard.set_balance(
             self.master_address.as_str(),
@@ -349,7 +354,14 @@ impl Blockchain {
     }
 
     async fn execute_transaction(&mut self, tx: &mut Transaction) -> Result<(), TxError> {
-        tx.gas_used = 21000;
+        // Set gas based on tx type
+        tx.gas_used = match &tx.tx_type {
+            TxType::Transfer => 21000,
+            TxType::Deploy => 200000,
+            TxType::Call => 50000,
+            TxType::CreateToken => 100000,
+            TxType::TransferToken => 65000,
+        };
 
         // Verify signature
         match tx.verify_signature() {
@@ -372,21 +384,33 @@ impl Blockchain {
             return Err(TxError::InvalidNonce { expected: expected_nonce, got: tx.nonce });
         }
 
+        // Calculate gas fee
+        let gas_fee = tx.gas_used * tx.gas_price;
+
+        // Check balance for gas fee (+ value for transfers)
+        let total_cost = match &tx.tx_type {
+            TxType::Transfer => tx.value + gas_fee,
+            _ => gas_fee,
+        };
+
+        {
+            let state_guard = self.state.read().await;
+            let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+            if from_balance < total_cost {
+                return Err(TxError::InsufficientBalance { required: total_cost, available: from_balance });
+            }
+        }
+
+        // Execute transaction based on type
         match &tx.tx_type {
             TxType::Transfer => {
                 let mut state_guard = self.state.write().await;
                 let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
-                let total_cost = tx.value + (tx.gas_used * tx.gas_price);
-                
-                if from_balance < total_cost {
-                    return Err(TxError::InsufficientBalance { required: total_cost, available: from_balance });
-                }
 
                 let to = tx.to.as_ref().ok_or_else(|| TxError::InvalidRecipient { 
                     message: "Missing recipient address".to_string() 
                 })?;
                 
-                // Validate recipient address
                 let to_addr = Address::new(to);
                 if !to_addr.is_valid() {
                     return Err(TxError::InvalidAddress { address: to.clone() });
@@ -394,28 +418,41 @@ impl Blockchain {
 
                 let to_balance = state_guard.get_balance(to).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                 
+                // Deduct value + gas fee from sender
                 state_guard.set_balance(&tx.from, from_balance - total_cost).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                // Add value to recipient
                 state_guard.set_balance(to, to_balance + tx.value).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                 state_guard.increment_nonce(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
             }
             TxType::Deploy => {
-                tx.gas_used = 200000;
                 let mut state_guard = self.state.write().await;
+                let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                
+                // Deduct gas fee
+                state_guard.set_balance(&tx.from, from_balance - gas_fee).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                 state_guard.increment_nonce(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
             }
             TxType::Call => {
-                tx.gas_used = 50000;
                 if let Some(TxData::Call { contract, method, args }) = &tx.data {
                     let mut state_guard = self.state.write().await;
+                    let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
+                    // Deduct gas fee
+                    state_guard.set_balance(&tx.from, from_balance - gas_fee).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
                     self.mvm.execute_call(&mut state_guard, contract, method, args)
                         .map_err(|e| TxError::ContractError { message: e.to_string() })?;
                     state_guard.increment_nonce(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                 }
             }
             TxType::CreateToken => {
-                tx.gas_used = 100000;
                 if let Some(TxData::CreateToken { name, symbol, total_supply }) = &tx.data {
                     let mut state_guard = self.state.write().await;
+                    let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
+                    // Deduct gas fee
+                    state_guard.set_balance(&tx.from, from_balance - gas_fee).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
                     let contract_address = crate::standards::create_mvm20_token(
                         &mut state_guard,
                         &tx.from,
@@ -428,21 +465,24 @@ impl Blockchain {
                 }
             }
             TxType::TransferToken => {
-                tx.gas_used = 65000;
                 if let Some(TxData::TransferToken { contract, to, amount }) = &tx.data {
                     let mut state_guard = self.state.write().await;
+                    let from_balance = state_guard.get_balance(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
+                    
+                    // Deduct gas fee
+                    state_guard.set_balance(&tx.from, from_balance - gas_fee).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                     
                     // Check token exists
                     let token = state_guard.get_token(contract)
                         .map_err(|e| TxError::InternalError { message: e.to_string() })?
                         .ok_or_else(|| TxError::TokenNotFound { contract: contract.clone() })?;
                     
-                    // Check balance
-                    let from_balance = state_guard.get_token_balance(contract, &tx.from)
+                    // Check token balance
+                    let token_balance = state_guard.get_token_balance(contract, &tx.from)
                         .map_err(|e| TxError::InternalError { message: e.to_string() })?;
                     
-                    if from_balance < *amount {
-                        return Err(TxError::InsufficientTokenBalance { required: *amount, available: from_balance });
+                    if token_balance < *amount {
+                        return Err(TxError::InsufficientTokenBalance { required: *amount, available: token_balance });
                     }
                     
                     // Validate recipient
@@ -461,7 +501,7 @@ impl Blockchain {
                     
                     state_guard.increment_nonce(&tx.from).map_err(|e| TxError::InternalError { message: e.to_string() })?;
                     
-                    drop(token); // suppress unused warning
+                    drop(token);
                 }
             }
         }
