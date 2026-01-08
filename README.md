@@ -31,9 +31,12 @@ A custom Layer 1 blockchain with the **Mosh** smart contract language, MVM-20 to
 - ✅ Access control (onlyOwner)
 - ✅ MBI (Mosh Binary Interface)
 - ✅ Transaction signing & verification
+- ✅ **Mempool** with nonce ordering
+- ✅ Pending nonce tracking
+- ✅ Duplicate TX rejection
 - ✅ WebSocket for real-time updates
 - ✅ P2P for full nodes
-- ✅ REST API (32 endpoints)
+- ✅ REST API (34 endpoints)
 - ✅ Faucet (testnet)
 - ✅ RocksDB storage
 - ✅ State pruning for light sync
@@ -45,6 +48,7 @@ A custom Layer 1 blockchain with the **Mosh** smart contract language, MVM-20 to
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
 - [API Reference](#api-reference)
+- [Mempool](#mempool)
 - [Transaction Signing](#transaction-signing)
 - [Gas Fees](#gas-fees)
 - [MVM-20 Tokens](#mvm-20-tokens)
@@ -161,7 +165,8 @@ Base URL: `http://localhost:8545`
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | API info & endpoints |
-| `/status` | GET | Chain status |
+| `/status` | GET | Chain status (includes pending TX count) |
+| `/mempool` | GET | View pending transactions |
 | `/blocks?limit=10` | GET | Recent blocks |
 | `/block/:height` | GET | Block by height |
 | `/block/latest` | GET | Latest block |
@@ -171,6 +176,9 @@ Base URL: `http://localhost:8545`
 ```bash
 # Get status
 curl http://localhost:8545/status
+
+# View mempool
+curl http://localhost:8545/mempool
 
 # Get latest block
 curl http://localhost:8545/block/latest
@@ -185,7 +193,8 @@ curl "http://localhost:8545/txs?limit=10"
 |----------|--------|-------------|
 | `/wallet/new` | GET | Create new wallet |
 | `/balance/:address` | GET | Native MVM balance |
-| `/nonce/:address` | GET | Current nonce |
+| `/nonce/:address` | GET | Confirmed nonce |
+| `/nonce/pending/:address` | GET | Pending nonce (includes mempool) |
 | `/account/:address` | GET | Full account info |
 | `/txs/:address` | GET | Address transactions |
 | `/faucet/:address` | POST | Get test tokens |
@@ -244,6 +253,85 @@ curl -X POST http://localhost:8545/faucet/mvm1abc123...
 |----------|-------------|
 | `/ws` | Browser connection (real-time updates) |
 | `/p2p` | Full node connection |
+
+---
+
+## Mempool
+
+The mempool holds pending transactions before they're included in a block.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Nonce Ordering** | Transactions sorted by (sender, nonce) |
+| **Deduplication** | Same TX hash rejected |
+| **Pending Nonce** | Track next nonce including mempool |
+| **Per-Address Query** | Get pending TXs for specific address |
+
+### API Endpoints
+
+```bash
+# View all pending transactions
+curl http://localhost:8545/mempool
+
+# Response:
+{
+  "success": true,
+  "count": 3,
+  "transactions": [
+    {
+      "hash": "abc123...",
+      "from": "mvm1sender...",
+      "to": "mvm1receiver...",
+      "value": 1000000000000000000,
+      "nonce": 5,
+      "tx_type": "transfer"
+    }
+  ]
+}
+
+# Get pending nonce (use this for your next TX!)
+curl http://localhost:8545/nonce/pending/mvm1youraddress...
+
+# Response:
+{
+  "success": true,
+  "address": "mvm1...",
+  "pending_nonce": 8,
+  "note": "Use this nonce for your next transaction"
+}
+
+# Status now includes pending count
+curl http://localhost:8545/status
+
+# Response includes:
+{
+  "pending_transactions": 3,
+  ...
+}
+```
+
+### Broadcasting Multiple Transactions
+
+```bash
+# Get pending nonce first
+NONCE=$(curl -s http://localhost:8545/nonce/pending/$ADDR | jq -r '.pending_nonce')
+
+# Submit TX 1 with nonce N
+# Submit TX 2 with nonce N+1  
+# Submit TX 3 with nonce N+2
+# All go to mempool, processed in order!
+```
+
+### Nonce Validation
+
+| Scenario | Result |
+|----------|--------|
+| Nonce == expected | ✅ Accepted |
+| Nonce < expected | ❌ `invalid_nonce` |
+| Nonce > expected | ❌ `invalid_nonce` |
+| Nonce already pending | ❌ `nonce_already_pending` |
 
 ---
 
@@ -984,7 +1072,8 @@ ngrok http 8545
 | Error | Description |
 |-------|-------------|
 | `invalid_signature` | Signature doesn't match sender |
-| `invalid_nonce` | Wrong nonce (get current nonce first) |
+| `invalid_nonce` | Wrong nonce (use `/nonce/pending/:address`) |
+| `nonce_already_pending` | TX with this nonce already in mempool |
 | `insufficient_balance` | Not enough balance |
 | `contract_not_found` | Contract doesn't exist |
 | `method_not_found` | Method doesn't exist |
@@ -998,19 +1087,48 @@ ngrok http 8545
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| Chain | 7 | Status, blocks, transactions |
-| Accounts | 6 | Wallets, balances, faucet |
+| Chain | 8 | Status, mempool, blocks, transactions |
+| Accounts | 7 | Wallets, balances, nonces, faucet |
 | Tokens | 5 | MVM-20 operations |
 | Contracts | 7 | Deploy, call, read (5 FREE) |
 | Transactions | 2 | Sign, submit |
 | WebSocket | 2 | Real-time updates |
-| **Total** | **32** | |
+| **Total** | **34** | |
 
 ---
 
 ## License
 
 MIT
+
+---
+
+## Testing
+
+Run the comprehensive test suite:
+
+```bash
+chmod +x test-all-apis.sh
+./test-all-apis.sh
+```
+
+### Test Coverage (61 Tests)
+
+| Section | Tests |
+|---------|-------|
+| Chain Info | 9 |
+| Wallet & Accounts | 8 |
+| Signature Verification | 4 |
+| MVM-20 Tokens | 7 |
+| Simple Contract | 3 |
+| Free Reads | 5 |
+| Contract with Mappings | 5 |
+| Contract with Functions | 9 |
+| Access Control | 3 |
+| Transaction History | 2 |
+| Mempool & Pending Nonce | 10 |
+| Final Status | 1 |
+| **Total** | **61** |
 
 ---
 
