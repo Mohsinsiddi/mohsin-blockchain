@@ -44,6 +44,7 @@ pub async fn start_api_server(
     let app = Router::new()
         .route("/", get(index))
         .route("/status", get(get_status))
+        .route("/mempool", get(get_mempool))
         .route("/block/:height", get(get_block))
         .route("/block/latest", get(get_latest_block))
         .route("/blocks", get(get_blocks))
@@ -51,6 +52,7 @@ pub async fn start_api_server(
         .route("/txs", get(get_recent_transactions))
         .route("/balance/:address", get(get_balance))
         .route("/nonce/:address", get(get_nonce))
+        .route("/nonce/pending/:address", get(get_pending_nonce))
         .route("/account/:address", get(get_account))
         .route("/txs/:address", get(get_address_transactions))
         .route("/faucet/:address", post(faucet))
@@ -91,6 +93,7 @@ async fn index() -> impl IntoResponse {
         "endpoints": {
             "chain": {
                 "status": "GET /status",
+                "mempool": "GET /mempool",
                 "blocks": "GET /blocks?limit=10",
                 "block": "GET /block/:height",
                 "latest": "GET /block/latest",
@@ -100,6 +103,7 @@ async fn index() -> impl IntoResponse {
             "accounts": {
                 "balance": "GET /balance/:address",
                 "nonce": "GET /nonce/:address",
+                "pending_nonce": "GET /nonce/pending/:address",
                 "account": "GET /account/:address",
                 "txs": "GET /txs/:address",
                 "wallet": "GET /wallet/new",
@@ -143,6 +147,7 @@ struct StatusResponse {
     chain_name: String,
     height: u64,
     total_supply: String,
+    pending_transactions: usize,
     peers: usize,
     browsers: usize,
     node_type: String,
@@ -156,6 +161,10 @@ async fn get_status(
     let total_supply = state_guard.get_total_supply().unwrap_or(0);
     drop(state_guard);
 
+    let blockchain = state.blockchain.read().await;
+    let pending = blockchain.pending_count();
+    drop(blockchain);
+
     let network = state.network.read().await;
     let peers = network.peer_count();
     let browsers = network.browser_count();
@@ -166,10 +175,59 @@ async fn get_status(
         chain_name: state.config.chain.chain_name.clone(),
         height,
         total_supply: format_balance(total_supply),
+        pending_transactions: pending,
         peers,
         browsers,
         node_type: state.config.node.node_type.clone(),
     })
+}
+
+// ===== MEMPOOL =====
+
+async fn get_mempool(
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let blockchain = state.blockchain.read().await;
+    let pending = blockchain.mempool.get_pending(100);
+    let count = blockchain.pending_count();
+    drop(blockchain);
+    
+    let txs: Vec<serde_json::Value> = pending.iter().map(|tx| {
+        serde_json::json!({
+            "hash": tx.hash,
+            "from": tx.from,
+            "to": tx.to,
+            "value": tx.value,
+            "nonce": tx.nonce,
+            "tx_type": tx.tx_type,
+            "timestamp": tx.timestamp,
+        })
+    }).collect();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "count": count,
+        "transactions": txs
+    }))
+}
+
+async fn get_pending_nonce(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let blockchain = state.blockchain.read().await;
+    match blockchain.get_pending_nonce(&address).await {
+        Ok(nonce) => Json(serde_json::json!({
+            "success": true,
+            "address": address,
+            "pending_nonce": nonce,
+            "note": "Use this nonce for your next transaction"
+        })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string()
+        }))).into_response(),
+    }
 }
 
 async fn get_block(
@@ -1473,11 +1531,23 @@ async fn submit_transaction(
         }))).into_response(),
     };
 
-    // Verify nonce
-    let expected_nonce = {
-        let state_guard = state.state.read().await;
-        state_guard.get_nonce(&req.from).unwrap_or(0)
+    // Verify nonce (check both confirmed and pending)
+    let (confirmed_nonce, pending_nonce) = {
+        // Get confirmed nonce from state
+        let confirmed = {
+            let state_guard = state.state.read().await;
+            state_guard.get_nonce(&req.from).unwrap_or(0)
+        };
+        
+        // Get pending nonce from mempool
+        let blockchain = state.blockchain.read().await;
+        let pending = blockchain.mempool.get_pending_nonce(&req.from, confirmed);
+        
+        (confirmed, pending)
     };
+    
+    // Expected nonce is the pending nonce (accounts for mempool TXs)
+    let expected_nonce = pending_nonce;
 
     if req.nonce != expected_nonce {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -1485,8 +1555,21 @@ async fn submit_transaction(
             "error": "invalid_nonce",
             "message": format!("Invalid nonce: expected {}, got {}", expected_nonce, req.nonce),
             "expected_nonce": expected_nonce,
-            "got_nonce": req.nonce
+            "got_nonce": req.nonce,
+            "confirmed_nonce": confirmed_nonce
         }))).into_response();
+    }
+    
+    // Also check if this exact sender+nonce is already in mempool
+    {
+        let blockchain = state.blockchain.read().await;
+        if blockchain.mempool.has_pending_nonce(&req.from, req.nonce) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": "nonce_already_pending",
+                "message": format!("Transaction with nonce {} is already pending", req.nonce)
+            }))).into_response();
+        }
     }
 
     // Parse data first (before signature verification)

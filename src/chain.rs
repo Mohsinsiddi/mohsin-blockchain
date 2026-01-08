@@ -265,10 +265,160 @@ impl Block {
     }
 }
 
+/// Transaction pool with nonce ordering and deduplication
+#[derive(Debug, Default)]
+pub struct Mempool {
+    /// All pending transactions by hash (for deduplication)
+    pub by_hash: std::collections::HashMap<String, Transaction>,
+    /// Transactions grouped by sender, sorted by nonce
+    pub by_sender: std::collections::HashMap<String, std::collections::BTreeMap<u64, String>>,
+    /// Total count
+    pub count: usize,
+}
+
+impl Mempool {
+    pub fn new() -> Self {
+        Mempool {
+            by_hash: std::collections::HashMap::new(),
+            by_sender: std::collections::HashMap::new(),
+            count: 0,
+        }
+    }
+    
+    /// Add transaction to mempool
+    /// Returns Ok(true) if added, Ok(false) if duplicate hash, Err if same sender+nonce exists
+    pub fn add(&mut self, tx: Transaction) -> Result<bool, String> {
+        let hash = tx.hash.clone();
+        let sender = tx.from.clone();
+        let nonce = tx.nonce;
+        
+        // Check duplicate hash
+        if self.by_hash.contains_key(&hash) {
+            return Ok(false);
+        }
+        
+        // Check if same sender+nonce already exists - REJECT (not replace)
+        if let Some(sender_txs) = self.by_sender.get(&sender) {
+            if sender_txs.contains_key(&nonce) {
+                return Err(format!("Transaction with nonce {} already pending for {}", nonce, sender));
+            }
+        }
+        
+        // Add to by_hash
+        self.by_hash.insert(hash.clone(), tx);
+        
+        // Add to by_sender
+        self.by_sender
+            .entry(sender)
+            .or_insert_with(std::collections::BTreeMap::new)
+            .insert(nonce, hash);
+        
+        self.count += 1;
+        Ok(true)
+    }
+    
+    /// Remove transaction by hash
+    pub fn remove(&mut self, hash: &str) -> Option<Transaction> {
+        if let Some(tx) = self.by_hash.remove(hash) {
+            if let Some(sender_txs) = self.by_sender.get_mut(&tx.from) {
+                sender_txs.remove(&tx.nonce);
+                if sender_txs.is_empty() {
+                    self.by_sender.remove(&tx.from);
+                }
+            }
+            self.count -= 1;
+            Some(tx)
+        } else {
+            None
+        }
+    }
+    
+    /// Get transactions ready for block (sorted by sender, then nonce)
+    pub fn get_pending(&self, max: usize) -> Vec<Transaction> {
+        let mut result = Vec::new();
+        
+        // Collect all transactions
+        for tx in self.by_hash.values() {
+            result.push(tx.clone());
+        }
+        
+        // Sort by (sender, nonce) to ensure correct ordering
+        result.sort_by(|a, b| {
+            match a.from.cmp(&b.from) {
+                std::cmp::Ordering::Equal => a.nonce.cmp(&b.nonce),
+                other => other,
+            }
+        });
+        
+        result.truncate(max);
+        result
+    }
+    
+    /// Drain transactions for block (removes them from mempool)
+    pub fn drain_for_block(&mut self, max: usize) -> Vec<Transaction> {
+        let txs = self.get_pending(max);
+        for tx in &txs {
+            self.remove(&tx.hash);
+        }
+        txs
+    }
+    
+    /// Check if transaction exists
+    pub fn contains(&self, hash: &str) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+    
+    /// Get pending count
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    
+    /// Get all pending transaction hashes
+    pub fn get_hashes(&self) -> Vec<String> {
+        self.by_hash.keys().cloned().collect()
+    }
+    
+    /// Get pending transactions for an address
+    pub fn get_by_sender(&self, sender: &str) -> Vec<Transaction> {
+        if let Some(sender_txs) = self.by_sender.get(sender) {
+            sender_txs.values()
+                .filter_map(|hash| self.by_hash.get(hash).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+    
+    /// Get pending nonce for address (next expected nonce)
+    /// Returns the higher of: confirmed_nonce or (max_pending_nonce + 1)
+    pub fn get_pending_nonce(&self, sender: &str, confirmed_nonce: u64) -> u64 {
+        if let Some(sender_txs) = self.by_sender.get(sender) {
+            if let Some((&max_nonce, _)) = sender_txs.iter().last() {
+                // Return the higher of confirmed nonce or pending nonce + 1
+                return std::cmp::max(confirmed_nonce, max_nonce + 1);
+            }
+        }
+        confirmed_nonce
+    }
+    
+    /// Check if a specific sender+nonce is already pending
+    pub fn has_pending_nonce(&self, sender: &str, nonce: u64) -> bool {
+        if let Some(sender_txs) = self.by_sender.get(sender) {
+            return sender_txs.contains_key(&nonce);
+        }
+        false
+    }
+}
+
 pub struct Blockchain {
     pub config: Config,
     pub state: Arc<RwLock<State>>,
-    pub mempool: Vec<Transaction>,
+    pub mempool: Mempool,
     pub master_address: Address,
     pub mvm: MVM,
 }
@@ -307,7 +457,7 @@ impl Blockchain {
         Ok(Blockchain {
             config,
             state,
-            mempool: Vec::new(),
+            mempool: Mempool::new(),
             master_address,
             mvm,
         })
@@ -319,20 +469,22 @@ impl Blockchain {
         let prev_block = state_guard.get_block(current_height)?.unwrap();
         drop(state_guard);
 
-        let txs: Vec<Transaction> = self.mempool
-            .drain(..)
-            .take(self.config.block.max_txs_per_block)
-            .collect();
+        // Get transactions from mempool (properly ordered by sender+nonce)
+        let txs = self.mempool.drain_for_block(self.config.block.max_txs_per_block);
+        
+        tracing::debug!("📦 Processing {} transactions from mempool", txs.len());
 
         let mut executed_txs = Vec::new();
         for mut tx in txs {
             match self.execute_transaction(&mut tx).await {
                 Ok(_) => {
                     tx.status = TxStatus::Success;
+                    tracing::debug!("✅ TX {} success", &tx.hash[..8]);
                 }
                 Err(e) => {
                     tx.status = TxStatus::Failed;
                     tx.error = Some(e.to_string());
+                    tracing::debug!("❌ TX {} failed: {}", &tx.hash[..8], e);
                 }
             }
             executed_txs.push(tx);
@@ -591,8 +743,39 @@ impl Blockchain {
 
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<String, BoxError> {
         let hash = tx.hash.clone();
-        self.mempool.push(tx);
-        Ok(hash)
+        
+        // Add to mempool (handles duplicate checking)
+        match self.mempool.add(tx) {
+            Ok(true) => {
+                tracing::debug!("📥 TX {} added to mempool (total: {})", &hash[..8], self.mempool.len());
+                Ok(hash)
+            }
+            Ok(false) => {
+                Err("Transaction already in mempool (duplicate hash)".into())
+            }
+            Err(e) => {
+                Err(e.into())
+            }
+        }
+    }
+    
+    /// Get pending transactions count
+    pub fn pending_count(&self) -> usize {
+        self.mempool.len()
+    }
+    
+    /// Get pending transactions for address
+    pub fn get_pending_txs(&self, address: &str) -> Vec<Transaction> {
+        self.mempool.get_by_sender(address)
+    }
+    
+    /// Get pending nonce (for next transaction)
+    pub async fn get_pending_nonce(&self, address: &str) -> Result<u64, BoxError> {
+        let confirmed_nonce = {
+            let state_guard = self.state.read().await;
+            state_guard.get_nonce(address)?
+        };
+        Ok(self.mempool.get_pending_nonce(address, confirmed_nonce))
     }
 
     pub async fn get_balance(&self, address: &str) -> Result<u64, BoxError> {

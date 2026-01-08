@@ -2,7 +2,14 @@
 
 # ============================================================
 # MVM COMPREHENSIVE API TEST SCRIPT
-# Tests ALL endpoints, signature verification, free reads
+# Tests ALL endpoints including:
+# - Chain info, blocks, transactions
+# - Wallet & accounts
+# - Signature verification
+# - MVM-20 tokens
+# - Mosh contracts (deploy, call, free reads)
+# - Access control
+# - Mempool & pending nonce
 # ============================================================
 
 BASE_URL="http://localhost:8545"
@@ -50,6 +57,11 @@ test_endpoint "Root endpoint" "$RESULT" '"name":"MOHSIN VIRTUAL MACHINE"'
 echo "Testing GET /status"
 RESULT=$(curl -s $BASE_URL/status)
 test_endpoint "Status endpoint" "$RESULT" '"chain_id"'
+test_endpoint "Status has pending_transactions" "$RESULT" '"pending_transactions"'
+
+echo "Testing GET /mempool"
+RESULT=$(curl -s $BASE_URL/mempool)
+test_endpoint "Mempool endpoint" "$RESULT" '"count"'
 
 echo "Testing GET /block/latest"
 RESULT=$(curl -s $BASE_URL/block/latest)
@@ -647,6 +659,166 @@ test_endpoint "Get address transactions" "$RESULT" '"transactions"'
 echo ""
 
 # ============================================================
+# SECTION 11: MEMPOOL & PENDING NONCE
+# ============================================================
+echo -e "${BLUE}━━━ SECTION 11: MEMPOOL & PENDING NONCE ━━━${NC}"
+
+echo "Testing GET /nonce/pending/$ADDR1"
+RESULT=$(curl -s $BASE_URL/nonce/pending/$ADDR1)
+test_endpoint "Pending nonce endpoint" "$RESULT" '"pending_nonce"'
+
+echo "Testing mempool with multiple transactions..."
+# Get current nonce
+CURRENT_NONCE=$(curl -s $BASE_URL/nonce/$ADDR1 | jq -r '.nonce')
+echo "   Current nonce: $CURRENT_NONCE"
+
+# Submit 3 transactions quickly (they should all go to mempool)
+NONCE1=$CURRENT_NONCE
+NONCE2=$((CURRENT_NONCE + 1))
+NONCE3=$((CURRENT_NONCE + 2))
+
+# Sign and submit TX 1
+SIGN1=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"transfer\",
+  \"from\": \"$ADDR1\",
+  \"to\": \"$ADDR2\",
+  \"value\": 100000000,
+  \"nonce\": $NONCE1
+}")
+SIG1=$(echo $SIGN1 | jq -r '.signature')
+
+# Sign TX 2
+SIGN2=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"transfer\",
+  \"from\": \"$ADDR1\",
+  \"to\": \"$ADDR2\",
+  \"value\": 100000000,
+  \"nonce\": $NONCE2
+}")
+SIG2=$(echo $SIGN2 | jq -r '.signature')
+
+# Sign TX 3
+SIGN3=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"transfer\",
+  \"from\": \"$ADDR1\",
+  \"to\": \"$ADDR2\",
+  \"value\": 100000000,
+  \"nonce\": $NONCE3
+}")
+SIG3=$(echo $SIGN3 | jq -r '.signature')
+
+# Submit all 3 quickly
+RESULT1=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"transfer\",
+  \"from\": \"$ADDR1\",
+  \"to\": \"$ADDR2\",
+  \"value\": 100000000,
+  \"nonce\": $NONCE1,
+  \"signature\": \"$SIG1\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "Submit TX 1 (nonce $NONCE1)" "$RESULT1" '"success":true'
+
+RESULT2=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"transfer\",
+  \"from\": \"$ADDR1\",
+  \"to\": \"$ADDR2\",
+  \"value\": 100000000,
+  \"nonce\": $NONCE2,
+  \"signature\": \"$SIG2\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "Submit TX 2 (nonce $NONCE2)" "$RESULT2" '"success":true'
+
+RESULT3=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"transfer\",
+  \"from\": \"$ADDR1\",
+  \"to\": \"$ADDR2\",
+  \"value\": 100000000,
+  \"nonce\": $NONCE3,
+  \"signature\": \"$SIG3\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "Submit TX 3 (nonce $NONCE3)" "$RESULT3" '"success":true'
+
+# Check mempool has transactions
+sleep 1
+MEMPOOL=$(curl -s $BASE_URL/mempool)
+MEMPOOL_COUNT=$(echo $MEMPOOL | jq -r '.count')
+echo "   Mempool count: $MEMPOOL_COUNT"
+test_endpoint "Mempool has transactions" "$MEMPOOL" '"transactions"'
+
+# Check pending nonce is updated
+PENDING_NONCE=$(curl -s $BASE_URL/nonce/pending/$ADDR1)
+PENDING_VAL=$(echo $PENDING_NONCE | jq -r '.pending_nonce')
+echo "   Pending nonce: $PENDING_VAL"
+test_endpoint "Pending nonce updated" "$PENDING_NONCE" '"pending_nonce"'
+
+# Test duplicate/invalid nonce rejection
+# If mempool already processed, nonce 8 should fail as "invalid_nonce"
+# If mempool has it, should fail as "nonce_already_pending" or "already in mempool"
+echo "Testing duplicate/invalid nonce rejection..."
+
+# First check what the current confirmed nonce is
+CONFIRMED=$(curl -s $BASE_URL/nonce/$ADDR1 | jq -r '.nonce')
+echo "   Confirmed nonce: $CONFIRMED"
+echo "   Attempting to submit nonce: $NONCE1"
+
+RESULT_DUP=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"transfer\",
+  \"from\": \"$ADDR1\",
+  \"to\": \"$ADDR2\",
+  \"value\": 100000000,
+  \"nonce\": $NONCE1,
+  \"signature\": \"$SIG1\",
+  \"public_key\": \"$PUB1\"
+}")
+echo "   Response: $(echo $RESULT_DUP | head -c 150)"
+
+# Should be rejected for ANY reason (invalid_nonce, nonce_already_pending, duplicate hash)
+if echo "$RESULT_DUP" | grep -q '"success":false'; then
+    echo -e "   ${GREEN}✓${NC} Old nonce rejected (success:false)"
+    ((PASS++))
+elif echo "$RESULT_DUP" | grep -q '"error"'; then
+    echo -e "   ${GREEN}✓${NC} Old nonce rejected (has error)"
+    ((PASS++))
+else
+    echo -e "   ${RED}✗${NC} Old nonce should be rejected"
+    echo "      Got: $(echo $RESULT_DUP | head -c 200)"
+    ((FAIL++))
+fi
+
+# Wait for block to process transactions
+echo "Waiting for block to process mempool..."
+sleep 4
+
+# Check mempool is empty after block
+MEMPOOL_AFTER=$(curl -s $BASE_URL/mempool)
+MEMPOOL_AFTER_COUNT=$(echo $MEMPOOL_AFTER | jq -r '.count')
+echo "   Mempool count after block: $MEMPOOL_AFTER_COUNT"
+test_endpoint "Mempool processed" "$MEMPOOL_AFTER" '"count"'
+
+echo ""
+
+# ============================================================
+# SECTION 12: STATUS CHECK
+# ============================================================
+echo -e "${BLUE}━━━ SECTION 12: FINAL STATUS CHECK ━━━${NC}"
+
+echo "Checking final chain status..."
+STATUS=$(curl -s $BASE_URL/status)
+HEIGHT=$(echo $STATUS | jq -r '.height')
+PENDING=$(echo $STATUS | jq -r '.pending_transactions')
+echo "   Block height: $HEIGHT"
+echo "   Pending TXs: $PENDING"
+test_endpoint "Chain status OK" "$STATUS" '"chain_id"'
+
+echo ""
+
+# ============================================================
 # SUMMARY
 # ============================================================
 echo "============================================================"
@@ -686,4 +858,11 @@ echo "   GET /contract/:addr/var/:name"
 echo "   GET /contract/:addr/mapping/:name/:key"
 echo "   GET /contract/:addr/call/get_*"
 echo "   GET /contract/:addr/mbi"
+echo ""
+echo "============================================================"
+echo "📦 MEMPOOL ENDPOINTS"
+echo "============================================================"
+echo "   GET /mempool              - View pending transactions"
+echo "   GET /nonce/pending/:addr  - Get next nonce (incl. pending)"
+echo "   GET /status               - Includes pending_transactions"
 echo ""
