@@ -27,7 +27,10 @@ pub enum VarType {
 impl VarType {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "uint64" | "uint" | "number" => Some(VarType::Uint64),
+            // All uint variants → Uint64 (we store as u64 internally)
+            "uint64" | "uint" | "number" | "uint256" | "uint128" | "uint32" | "uint16" | "uint8" => Some(VarType::Uint64),
+            // All int variants → Uint64 (simplified, no negative support yet)
+            "int256" | "int128" | "int64" | "int32" | "int" => Some(VarType::Uint64),
             "string" | "str" => Some(VarType::String),
             "bool" | "boolean" => Some(VarType::Bool),
             "address" | "addr" => Some(VarType::Address),
