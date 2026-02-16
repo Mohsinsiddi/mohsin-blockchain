@@ -35,7 +35,7 @@ pub fn create_mvm20_token(
         address: contract_address.clone(),
         name: name.to_string(),
         symbol: symbol.to_string(),
-        decimals: 18,
+        decimals: 8,
         total_supply: total_supply * 100_000_000,
         creator: creator.to_string(),
         created_at: chrono::Utc::now().timestamp(),

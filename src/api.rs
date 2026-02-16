@@ -63,6 +63,7 @@ pub async fn start_api_server(
         .route("/tokens/holder/:address", get(get_token_holdings))
         .route("/token/:address", get(get_token))
         .route("/token/:contract/balance/:address", get(get_token_balance))
+        .route("/token/:contract/holders", get(get_token_holders))
         .route("/contracts", get(get_contracts))
         .route("/contracts/creator/:address", get(get_contracts_by_creator))
         .route("/contract/:address", get(get_contract))
@@ -71,6 +72,8 @@ pub async fn start_api_server(
         .route("/contract/:address/mapping/:name", get(get_contract_mapping))
         .route("/contract/:address/mapping/:name/:key", get(read_contract_mapping))
         .route("/contract/:address/call/:method", get(call_contract_view))
+        .route("/contract/:address/events", get(get_contract_events))
+        .route("/leaderboard", get(get_leaderboard))
         .route("/wallet/new", get(create_wallet))
         .route("/ws", get(ws_handler))
         .route("/p2p", get(p2p_handler))
@@ -133,10 +136,23 @@ async fn index() -> impl IntoResponse {
         },
         "tx_types": ["transfer", "create_token", "transfer_token", "deploy_contract", "call_contract"],
         "mosh": {
-            "types": ["uint64", "string", "bool", "address"],
-            "mappings": "mapping(key => value)",
-            "modifiers": ["view (FREE)", "write", "payable", "onlyOwner"],
-            "operations": ["set", "add", "sub", "map_set", "map_add", "map_sub", "require", "transfer", "return", "let"]
+            "types": ["uint64", "u256", "u64", "u8", "string", "bool", "address"],
+            "mappings": "map name: keyType => valType",
+            "modifiers": ["view/pub (FREE)", "write/mut", "payable/vault", "onlyOwner/seal"],
+            "operations": ["set", "add", "sub", "mul", "div", "mod", "map_set", "map_add", "map_sub", "map_mul", "map_div", "map_mod", "require/guard", "emit/signal", "if", "transfer", "return", "let"],
+            "keywords": {
+                "forge": "contract definition",
+                "fn": "function definition",
+                "let": "variable declaration",
+                "map": "mapping declaration",
+                "guard": "require/assert (unique)",
+                "signal": "emit event (unique)",
+                "vault": "payable modifier (unique)",
+                "seal": "onlyOwner modifier (unique)",
+                "pub": "view/read-only",
+                "mut": "state-mutating"
+            },
+            "special_values": ["msg.sender", "msg.value", "block.height", "block.timestamp", "mosh.balance", "mosh.height", "mosh.time"]
         }
     }))
 }
@@ -278,11 +294,12 @@ async fn get_transaction(
     match state_guard.get_transaction(&hash) {
         Ok(Some(tx)) => {
             let fee_paid = tx.gas_used * tx.gas_price;
-            Json(serde_json::json!({ 
+            let block_height = state_guard.get_transaction_block_height(&hash).unwrap_or(None);
+            Json(serde_json::json!({
                 "success": true,
                 "transaction": {
                     "hash": tx.hash,
-                    "tx_type": tx.tx_type,
+                    "tx_type": tx.tx_type.as_str(),
                     "from": tx.from,
                     "to": tx.to,
                     "value": format_balance(tx.value),
@@ -298,7 +315,8 @@ async fn get_transaction(
                     "signature": tx.signature,
                     "public_key": tx.public_key,
                     "status": tx.status,
-                    "error": tx.error
+                    "error": tx.error,
+                    "block_height": block_height
                 }
             })).into_response()
         },
@@ -391,9 +409,10 @@ async fn get_account(
     
     let txs_with_fees: Vec<serde_json::Value> = recent_txs.iter().map(|tx| {
         let fee_paid = tx.gas_used * tx.gas_price;
+        let block_height = state_guard.get_transaction_block_height(&tx.hash).unwrap_or(None);
         serde_json::json!({
             "hash": tx.hash,
-            "tx_type": tx.tx_type,
+            "tx_type": tx.tx_type.as_str(),
             "from": tx.from,
             "to": tx.to,
             "value": format_balance(tx.value),
@@ -404,10 +423,12 @@ async fn get_account(
             "nonce": tx.nonce,
             "timestamp": tx.timestamp,
             "status": tx.status,
-            "error": tx.error
+            "error": tx.error,
+            "block_height": block_height,
+            "data": tx.data
         })
     }).collect();
-    
+
     Json(serde_json::json!({
         "success": true,
         "account": {
@@ -451,9 +472,10 @@ async fn get_address_transactions(
     
     let txs_with_fees: Vec<serde_json::Value> = txs.iter().map(|tx| {
         let fee_paid = tx.gas_used * tx.gas_price;
+        let block_height = state_guard.get_transaction_block_height(&tx.hash).unwrap_or(None);
         serde_json::json!({
             "hash": tx.hash,
-            "tx_type": tx.tx_type,
+            "tx_type": tx.tx_type.as_str(),
             "from": tx.from,
             "to": tx.to,
             "value": format_balance(tx.value),
@@ -464,10 +486,12 @@ async fn get_address_transactions(
             "nonce": tx.nonce,
             "timestamp": tx.timestamp,
             "status": tx.status,
-            "error": tx.error
+            "error": tx.error,
+            "block_height": block_height,
+            "data": tx.data
         })
     }).collect();
-    
+
     Json(serde_json::json!({
         "success": true,
         "address": address,
@@ -1208,7 +1232,7 @@ async fn get_blocks(
                 "height": block.height,
                 "hash": block.hash,
                 "timestamp": block.timestamp,
-                "transactions": block.transactions.len(),
+                "tx_count": block.transactions.len(),
                 "validator": block.validator
             }));
         }
@@ -1248,15 +1272,22 @@ async fn get_recent_transactions(
                 if txs.len() >= limit {
                     break;
                 }
+                let fee_paid = tx.gas_used * tx.gas_price;
                 txs.push(serde_json::json!({
                     "hash": tx.hash,
-                    "type": tx.tx_type.as_str(),
+                    "tx_type": tx.tx_type.as_str(),
                     "from": tx.from,
                     "to": tx.to,
-                    "value": tx.value,
-                    "status": format!("{:?}", tx.status),
-                    "block": h,
-                    "timestamp": tx.timestamp
+                    "value": format_balance(tx.value),
+                    "value_raw": tx.value,
+                    "gas_used": tx.gas_used,
+                    "fee_paid": format_balance(fee_paid),
+                    "fee_paid_raw": fee_paid,
+                    "status": tx.status,
+                    "block_height": h,
+                    "timestamp": tx.timestamp,
+                    "nonce": tx.nonce,
+                    "error": tx.error
                 }));
             }
         }
@@ -1267,6 +1298,45 @@ async fn get_recent_transactions(
         "count": txs.len(),
         "transactions": txs
     }))
+}
+
+// ===== CONTRACT EVENTS =====
+
+async fn get_contract_events(
+    Path(address): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    match state_guard.get_contract_events(&address) {
+        Ok(events) => Json(serde_json::json!({
+            "success": true,
+            "contract": address,
+            "count": events.len(),
+            "events": events
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
+}
+
+// ===== LEADERBOARD =====
+
+async fn get_leaderboard(
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+    match state_guard.get_leaderboard() {
+        Ok(data) => Json(serde_json::json!({
+            "success": true,
+            "leaderboard": data
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string()
+        })),
+    }
 }
 
 async fn create_wallet() -> impl IntoResponse {
@@ -1325,12 +1395,43 @@ async fn faucet(
 
     let current_balance = state_guard.get_balance(&address).unwrap_or(0);
     if let Err(e) = state_guard.set_balance(&address, current_balance + amount) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ 
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "success": false,
             "error": "internal_error",
-            "message": e.to_string() 
+            "message": e.to_string()
         }))).into_response();
     }
+
+    // Create a faucet transaction record so it appears in activity
+    let tx_hash = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(format!("faucet:{}:{}", address, now));
+        hex::encode(hasher.finalize())
+    };
+
+    let faucet_tx = Transaction {
+        hash: tx_hash.clone(),
+        tx_type: TxType::Transfer,
+        from: "mvm1faucet".to_string(),
+        to: Some(address.clone()),
+        value: amount,
+        gas_price: 0,
+        gas_limit: 0,
+        gas_used: 0,
+        nonce: 0,
+        data: None,
+        timestamp: now,
+        signature: String::new(),
+        public_key: String::new(),
+        status: TxStatus::Success,
+        error: None,
+    };
+
+    // Save and index the faucet transaction so it appears in activity
+    let current_height = state_guard.get_height().unwrap_or(0);
+    let _ = state_guard.save_transaction(&faucet_tx);
+    let _ = state_guard.index_transaction(&faucet_tx, current_height);
 
     let _ = state_guard.set_faucet_claim(&address, now);
 
@@ -1338,7 +1439,8 @@ async fn faucet(
         "success": true,
         "address": address,
         "amount": format_balance(amount),
-        "new_balance": format_balance(current_balance + amount)
+        "new_balance": format_balance(current_balance + amount),
+        "tx_hash": tx_hash
     })).into_response()
 }
 
@@ -1868,6 +1970,45 @@ async fn get_token_balance(
         "address": address,
         "balance": format_balance(balance),
         "balance_raw": balance
+    })).into_response()
+}
+
+async fn get_token_holders(
+    Path(contract): Path<String>,
+    AxumState(state): AxumState<SharedState>,
+) -> impl IntoResponse {
+    let state_guard = state.state.read().await;
+
+    // Verify token exists
+    match state_guard.get_token(&contract) {
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "token_not_found",
+            "message": format!("Token not found: {}", contract)
+        }))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": "internal_error",
+            "message": e.to_string()
+        }))).into_response(),
+        Ok(Some(_)) => {}
+    }
+
+    let holders = state_guard.get_token_holders(&contract).unwrap_or_default();
+
+    let holders_json: Vec<serde_json::Value> = holders.iter().map(|(addr, bal)| {
+        serde_json::json!({
+            "address": addr,
+            "balance": format_balance(*bal),
+            "balance_raw": bal
+        })
+    }).collect();
+
+    Json(serde_json::json!({
+        "success": true,
+        "contract": contract,
+        "holder_count": holders_json.len(),
+        "holders": holders_json
     })).into_response()
 }
 

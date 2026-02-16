@@ -13,6 +13,7 @@ pub const MAX_FUNCTIONS: usize = 10;
 pub const MAX_OPS_PER_FUNCTION: usize = 20;
 pub const MAX_STRING_LENGTH: usize = 256;
 pub const MAX_NAME_LENGTH: usize = 32;
+pub const MAX_NESTING_DEPTH: usize = 5;
 
 // ==================== TYPES ====================
 
@@ -29,6 +30,8 @@ impl VarType {
         match s.to_lowercase().as_str() {
             // All uint variants → Uint64 (we store as u64 internally)
             "uint64" | "uint" | "number" | "uint256" | "uint128" | "uint32" | "uint16" | "uint8" => Some(VarType::Uint64),
+            // Rust-style short aliases (Mosh language)
+            "u256" | "u128" | "u64" | "u32" | "u16" | "u8" => Some(VarType::Uint64),
             // All int variants → Uint64 (simplified, no negative support yet)
             "int256" | "int128" | "int64" | "int32" | "int" => Some(VarType::Uint64),
             "string" | "str" => Some(VarType::String),
@@ -70,6 +73,19 @@ pub enum FnModifier {
     OnlyOwner,
 }
 
+impl FnModifier {
+    /// Parse from string, supporting both standard and Mosh keyword aliases
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "view" | "pub" => Some(FnModifier::View),
+            "write" | "mut" => Some(FnModifier::Write),
+            "payable" | "vault" => Some(FnModifier::Payable),
+            "onlyowner" | "only_owner" | "seal" => Some(FnModifier::OnlyOwner),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub op: String,
@@ -93,6 +109,36 @@ pub struct Operation {
     pub to: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<serde_json::Value>,
+    // If/else control flow
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Box<ConditionExpr>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then_body: Option<Vec<Operation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub else_body: Option<Vec<Operation>>,
+    // Event emit/signal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_args: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionExpr {
+    pub left: serde_json::Value,
+    pub cmp: String,
+    pub right: serde_json::Value,
+}
+
+// ==================== CONTRACT EVENTS ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractEvent {
+    pub name: String,
+    pub args: Vec<serde_json::Value>,
+    pub contract: String,
+    pub block_height: u64,
+    pub timestamp: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,14 +192,19 @@ pub struct CallResult {
     pub data: Option<serde_json::Value>,
     pub error: Option<String>,
     pub gas_used: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<ContractEvent>,
 }
 
 impl CallResult {
     pub fn ok(data: serde_json::Value, gas: u64) -> Self {
-        CallResult { success: true, data: Some(data), error: None, gas_used: gas }
+        CallResult { success: true, data: Some(data), error: None, gas_used: gas, events: Vec::new() }
+    }
+    pub fn ok_with_events(data: serde_json::Value, gas: u64, events: Vec<ContractEvent>) -> Self {
+        CallResult { success: true, data: Some(data), error: None, gas_used: gas, events }
     }
     pub fn err(msg: &str, gas: u64) -> Self {
-        CallResult { success: false, data: None, error: Some(msg.to_string()), gas_used: gas }
+        CallResult { success: false, data: None, error: Some(msg.to_string()), gas_used: gas, events: Vec::new() }
     }
 }
 
@@ -402,133 +453,287 @@ impl MVM {
             let contract_bal = state.get_token_balance(token_addr, contract_addr)?;
             state.set_token_balance(token_addr, contract_addr, contract_bal + amount)?;
         }
-        
-        // Execute operations
+
+        // Execute operations using recursive helper
+        let mut events: Vec<ContractEvent> = Vec::new();
         let mut return_value: Option<serde_json::Value> = None;
-        
-        for op in &func.body {
-            gas += 1000;
-            
-            match op.op.as_str() {
+
+        let exec_result = self.execute_ops(
+            state, &contract, contract_addr, &func.body,
+            &mut ctx, &mut gas, &mut events, &mut return_value, 0,
+        );
+
+        match exec_result {
+            Ok(()) => {
+                // Save events to state
+                for event in &events {
+                    let _ = state.save_contract_event(event);
+                }
+                Ok(CallResult::ok_with_events(
+                    return_value.unwrap_or(serde_json::json!({"success": true})),
+                    gas,
+                    events,
+                ))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Check if it's a guard/require failure (starts with "GUARD:")
+                if let Some(guard_msg) = msg.strip_prefix("GUARD:") {
+                    Ok(CallResult::err(guard_msg, gas))
+                } else {
+                    Ok(CallResult::err(&msg, gas))
+                }
+            }
+        }
+    }
+
+    /// Recursive operation executor — supports if/else nesting
+    fn execute_ops(
+        &self,
+        state: &mut State,
+        contract: &MoshContract,
+        contract_addr: &str,
+        ops: &[Operation],
+        ctx: &mut ExecContext,
+        gas: &mut u64,
+        events: &mut Vec<ContractEvent>,
+        return_value: &mut Option<serde_json::Value>,
+        depth: usize,
+    ) -> Result<(), BoxError> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err("Max nesting depth exceeded".into());
+        }
+
+        for op in ops {
+            *gas += 1000;
+
+            // Normalize opcode: guard → require, signal → emit
+            let op_name = match op.op.as_str() {
+                "guard" => "require",
+                "signal" => "emit",
+                other => other,
+            };
+
+            match op_name {
                 // SET variable
                 "set" => {
                     let var = op.var.as_deref().unwrap_or("");
-                    let value = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
+                    let value = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
                     state.set_mosh_var(contract_addr, var, &value)?;
                 }
-                
+
                 // ADD to variable
                 "add" => {
                     let var = op.var.as_deref().unwrap_or("");
-                    let add_val = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
+                    let add_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
                     let current = state.get_mosh_var(contract_addr, var)?.unwrap_or("0".to_string());
                     let new_val = current.parse::<u64>().unwrap_or(0) + add_val.parse::<u64>().unwrap_or(0);
                     state.set_mosh_var(contract_addr, var, &new_val.to_string())?;
                 }
-                
+
                 // SUB from variable
                 "sub" => {
                     let var = op.var.as_deref().unwrap_or("");
-                    let sub_val = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
+                    let sub_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
                     let current = state.get_mosh_var(contract_addr, var)?.unwrap_or("0".to_string());
                     let new_val = current.parse::<u64>().unwrap_or(0).saturating_sub(sub_val.parse::<u64>().unwrap_or(0));
                     state.set_mosh_var(contract_addr, var, &new_val.to_string())?;
                 }
-                
+
+                // MUL variable
+                "mul" => {
+                    let var = op.var.as_deref().unwrap_or("");
+                    let mul_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
+                    let current = state.get_mosh_var(contract_addr, var)?.unwrap_or("0".to_string());
+                    let new_val = current.parse::<u64>().unwrap_or(0).saturating_mul(mul_val.parse::<u64>().unwrap_or(0));
+                    state.set_mosh_var(contract_addr, var, &new_val.to_string())?;
+                }
+
+                // DIV variable
+                "div" => {
+                    let var = op.var.as_deref().unwrap_or("");
+                    let div_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
+                    let current = state.get_mosh_var(contract_addr, var)?.unwrap_or("0".to_string());
+                    let divisor = div_val.parse::<u64>().unwrap_or(0).max(1); // Zero protection
+                    let new_val = current.parse::<u64>().unwrap_or(0) / divisor;
+                    state.set_mosh_var(contract_addr, var, &new_val.to_string())?;
+                }
+
+                // MOD variable
+                "mod" => {
+                    let var = op.var.as_deref().unwrap_or("");
+                    let mod_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
+                    let current = state.get_mosh_var(contract_addr, var)?.unwrap_or("0".to_string());
+                    let divisor = mod_val.parse::<u64>().unwrap_or(0).max(1);
+                    let new_val = current.parse::<u64>().unwrap_or(0) % divisor;
+                    state.set_mosh_var(contract_addr, var, &new_val.to_string())?;
+                }
+
                 // MAP_SET
                 "map_set" => {
                     let map = op.map.as_deref().unwrap_or("");
-                    let key = self.resolve_value(state, &contract, &ctx, op.key.as_ref())?;
-                    let value = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
+                    let key = self.resolve_value(state, contract, ctx, op.key.as_ref())?;
+                    let value = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
                     state.set_mosh_map(contract_addr, map, &key, &value)?;
                 }
-                
+
                 // MAP_ADD
                 "map_add" => {
                     let map = op.map.as_deref().unwrap_or("");
-                    let key = self.resolve_value(state, &contract, &ctx, op.key.as_ref())?;
-                    let add_val = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
+                    let key = self.resolve_value(state, contract, ctx, op.key.as_ref())?;
+                    let add_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
                     let current = state.get_mosh_map(contract_addr, map, &key)?.unwrap_or("0".to_string());
                     let new_val = current.parse::<u64>().unwrap_or(0) + add_val.parse::<u64>().unwrap_or(0);
                     state.set_mosh_map(contract_addr, map, &key, &new_val.to_string())?;
                 }
-                
+
                 // MAP_SUB
                 "map_sub" => {
                     let map = op.map.as_deref().unwrap_or("");
-                    let key = self.resolve_value(state, &contract, &ctx, op.key.as_ref())?;
-                    let sub_val = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
+                    let key = self.resolve_value(state, contract, ctx, op.key.as_ref())?;
+                    let sub_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
                     let current = state.get_mosh_map(contract_addr, map, &key)?.unwrap_or("0".to_string());
                     let new_val = current.parse::<u64>().unwrap_or(0).saturating_sub(sub_val.parse::<u64>().unwrap_or(0));
                     state.set_mosh_map(contract_addr, map, &key, &new_val.to_string())?;
                 }
-                
-                // REQUIRE - check condition
+
+                // MAP_MUL
+                "map_mul" => {
+                    let map = op.map.as_deref().unwrap_or("");
+                    let key = self.resolve_value(state, contract, ctx, op.key.as_ref())?;
+                    let mul_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
+                    let current = state.get_mosh_map(contract_addr, map, &key)?.unwrap_or("0".to_string());
+                    let new_val = current.parse::<u64>().unwrap_or(0).saturating_mul(mul_val.parse::<u64>().unwrap_or(0));
+                    state.set_mosh_map(contract_addr, map, &key, &new_val.to_string())?;
+                }
+
+                // MAP_DIV
+                "map_div" => {
+                    let map = op.map.as_deref().unwrap_or("");
+                    let key = self.resolve_value(state, contract, ctx, op.key.as_ref())?;
+                    let div_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
+                    let current = state.get_mosh_map(contract_addr, map, &key)?.unwrap_or("0".to_string());
+                    let divisor = div_val.parse::<u64>().unwrap_or(0).max(1);
+                    let new_val = current.parse::<u64>().unwrap_or(0) / divisor;
+                    state.set_mosh_map(contract_addr, map, &key, &new_val.to_string())?;
+                }
+
+                // MAP_MOD
+                "map_mod" => {
+                    let map = op.map.as_deref().unwrap_or("");
+                    let key = self.resolve_value(state, contract, ctx, op.key.as_ref())?;
+                    let mod_val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
+                    let current = state.get_mosh_map(contract_addr, map, &key)?.unwrap_or("0".to_string());
+                    let divisor = mod_val.parse::<u64>().unwrap_or(0).max(1);
+                    let new_val = current.parse::<u64>().unwrap_or(0) % divisor;
+                    state.set_mosh_map(contract_addr, map, &key, &new_val.to_string())?;
+                }
+
+                // REQUIRE / GUARD - check condition
                 "require" => {
-                    let left = self.resolve_value(state, &contract, &ctx, op.left.as_ref())?;
+                    let left = self.resolve_value(state, contract, ctx, op.left.as_ref())?;
                     let cmp = op.cmp.as_deref().unwrap_or(">");
-                    let right = self.resolve_value(state, &contract, &ctx, op.right.as_ref())?;
+                    let right = self.resolve_value(state, contract, ctx, op.right.as_ref())?;
                     let msg = op.msg.as_deref().unwrap_or("Require failed");
-                    
-                    let left_num = left.parse::<u64>().unwrap_or(0);
-                    let right_num = right.parse::<u64>().unwrap_or(0);
-                    
-                    let pass = match cmp {
-                        ">" => left_num > right_num,
-                        ">=" => left_num >= right_num,
-                        "<" => left_num < right_num,
-                        "<=" => left_num <= right_num,
-                        "==" | "=" => left == right,
-                        "!=" => left != right,
-                        _ => false,
-                    };
-                    
-                    if !pass {
-                        return Ok(CallResult::err(msg, gas));
+
+                    if !self.eval_condition(&left, cmp, &right) {
+                        return Err(format!("GUARD:{}", msg).into());
                     }
                 }
-                
+
+                // IF/ELSE control flow
+                "if" => {
+                    let cond = op.condition.as_ref().ok_or("if: missing condition")?;
+                    let left = self.resolve_value(state, contract, ctx, Some(&cond.left))?;
+                    let right = self.resolve_value(state, contract, ctx, Some(&cond.right))?;
+
+                    if self.eval_condition(&left, &cond.cmp, &right) {
+                        if let Some(ref body) = op.then_body {
+                            self.execute_ops(state, contract, contract_addr, body, ctx, gas, events, return_value, depth + 1)?;
+                        }
+                    } else if let Some(ref body) = op.else_body {
+                        self.execute_ops(state, contract, contract_addr, body, ctx, gas, events, return_value, depth + 1)?;
+                    }
+                }
+
+                // EMIT / SIGNAL - emit event
+                "emit" => {
+                    let event_name = op.event_name.as_deref()
+                        .or(op.var.as_deref())
+                        .unwrap_or("Event");
+                    let mut resolved_args = Vec::new();
+                    if let Some(ref args_list) = op.event_args {
+                        for arg in args_list {
+                            let resolved = self.resolve_value(state, contract, ctx, Some(arg))?;
+                            resolved_args.push(serde_json::json!(resolved));
+                        }
+                    }
+                    events.push(ContractEvent {
+                        name: event_name.to_string(),
+                        args: resolved_args,
+                        contract: contract_addr.to_string(),
+                        block_height: ctx.block_height,
+                        timestamp: ctx.block_timestamp as i64,
+                    });
+                }
+
                 // TRANSFER tokens from contract to address
                 "transfer" => {
                     let token_addr = match &contract.token {
                         Some(t) => t.clone(),
-                        None => return Ok(CallResult::err("No token", gas)),
+                        None => return Err("No token".into()),
                     };
-                    
-                    let to = self.resolve_value(state, &contract, &ctx, op.to.as_ref())?;
-                    let amt = self.resolve_value(state, &contract, &ctx, op.amount.as_ref())?;
+
+                    let to = self.resolve_value(state, contract, ctx, op.to.as_ref())?;
+                    let amt = self.resolve_value(state, contract, ctx, op.amount.as_ref())?;
                     let amt_num = amt.parse::<u64>().unwrap_or(0);
-                    
+
                     let contract_bal = state.get_token_balance(&token_addr, contract_addr)?;
                     if contract_bal < amt_num {
-                        return Ok(CallResult::err("Contract balance low", gas));
+                        return Err("Contract balance low".into());
                     }
-                    
+
                     state.set_token_balance(&token_addr, contract_addr, contract_bal - amt_num)?;
                     let to_bal = state.get_token_balance(&token_addr, &to)?;
                     state.set_token_balance(&token_addr, &to, to_bal + amt_num)?;
                 }
-                
+
                 // RETURN value
                 "return" => {
-                    let val = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
-                    return_value = Some(serde_json::json!(val));
+                    let val = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
+                    *return_value = Some(serde_json::json!(val));
                 }
-                
+
                 // LET - local variable
                 "let" => {
                     let var = op.var.as_deref().unwrap_or("");
-                    let value = self.resolve_value(state, &contract, &ctx, op.value.as_ref())?;
+                    let value = self.resolve_value(state, contract, ctx, op.value.as_ref())?;
                     ctx.locals.insert(var.to_string(), value);
                 }
-                
+
                 _ => {
-                    return Ok(CallResult::err(&format!("Unknown op: {}", op.op), gas));
+                    return Err(format!("Unknown op: {}", op.op).into());
                 }
             }
         }
-        
-        Ok(CallResult::ok(return_value.unwrap_or(serde_json::json!({"success": true})), gas))
+
+        Ok(())
+    }
+
+    /// Evaluate a comparison condition
+    fn eval_condition(&self, left: &str, cmp: &str, right: &str) -> bool {
+        let left_num = left.parse::<u64>().unwrap_or(0);
+        let right_num = right.parse::<u64>().unwrap_or(0);
+
+        match cmp {
+            ">" => left_num > right_num,
+            ">=" => left_num >= right_num,
+            "<" => left_num < right_num,
+            "<=" => left_num <= right_num,
+            "==" | "=" => left == right,
+            "!=" => left != right,
+            _ => false,
+        }
     }
     
     /// Resolve a value - can be literal, variable, mapping, or special
@@ -546,14 +751,22 @@ impl MVM {
         
         // String literal
         if let Some(s) = val.as_str() {
-            // Special values
+            // Special values (standard + Mosh aliases)
             match s {
                 "msg.sender" => return Ok(ctx.caller.clone()),
-                "msg.amount" => return Ok(ctx.amount.to_string()),
-                "block.height" => return Ok(ctx.block_height.to_string()),
-                "block.timestamp" => return Ok(ctx.block_timestamp.to_string()),
+                "msg.amount" | "msg.value" => return Ok(ctx.amount.to_string()),
+                "block.height" | "mosh.height" => return Ok(ctx.block_height.to_string()),
+                "block.timestamp" | "mosh.time" => return Ok(ctx.block_timestamp.to_string()),
                 "contract.owner" => return Ok(contract.owner.clone()),
                 "contract.address" => return Ok(contract.address.clone()),
+                "mosh.balance" => {
+                    // Contract's token balance
+                    if let Some(ref token_addr) = contract.token {
+                        let bal = state.get_token_balance(token_addr, &contract.address)?;
+                        return Ok(bal.to_string());
+                    }
+                    return Ok("0".to_string());
+                }
                 _ => {}
             }
             

@@ -804,9 +804,274 @@ test_endpoint "Mempool processed" "$MEMPOOL_AFTER" '"count"'
 echo ""
 
 # ============================================================
-# SECTION 12: STATUS CHECK
+# SECTION 12: NEW OPCODES (mul, div, mod)
 # ============================================================
-echo -e "${BLUE}━━━ SECTION 12: FINAL STATUS CHECK ━━━${NC}"
+echo -e "${BLUE}━━━ SECTION 12: NEW OPCODES (mul, div, mod) ━━━${NC}"
+
+echo "Deploying Calculator contract with mul/div/mod..."
+NONCE=$(curl -s $BASE_URL/nonce/$ADDR1 | jq -r '.nonce')
+SIGN=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"deploy_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {
+    \"name\": \"Calculator\",
+    \"variables\": [{\"name\": \"result\", \"type\": \"uint256\", \"default\": \"10\"}],
+    \"functions\": [
+      {
+        \"name\": \"multiply\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"factor\", \"type\": \"uint256\"}],
+        \"body\": [{\"op\": \"mul\", \"var\": \"result\", \"value\": \"factor\"}]
+      },
+      {
+        \"name\": \"divide\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"divisor\", \"type\": \"uint256\"}],
+        \"body\": [{\"op\": \"div\", \"var\": \"result\", \"value\": \"divisor\"}]
+      },
+      {
+        \"name\": \"modulo\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"modval\", \"type\": \"uint256\"}],
+        \"body\": [{\"op\": \"mod\", \"var\": \"result\", \"value\": \"modval\"}]
+      },
+      {
+        \"name\": \"get_result\",
+        \"modifiers\": [\"view\"],
+        \"args\": [],
+        \"body\": [{\"op\": \"return\", \"value\": \"result\"}],
+        \"returns\": \"uint256\"
+      }
+    ]
+  }
+}")
+SIG=$(echo $SIGN | jq -r '.signature')
+
+RESULT=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"deploy_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {
+    \"name\": \"Calculator\",
+    \"variables\": [{\"name\": \"result\", \"type\": \"uint256\", \"default\": \"10\"}],
+    \"functions\": [
+      {
+        \"name\": \"multiply\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"factor\", \"type\": \"uint256\"}],
+        \"body\": [{\"op\": \"mul\", \"var\": \"result\", \"value\": \"factor\"}]
+      },
+      {
+        \"name\": \"divide\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"divisor\", \"type\": \"uint256\"}],
+        \"body\": [{\"op\": \"div\", \"var\": \"result\", \"value\": \"divisor\"}]
+      },
+      {
+        \"name\": \"modulo\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"modval\", \"type\": \"uint256\"}],
+        \"body\": [{\"op\": \"mod\", \"var\": \"result\", \"value\": \"modval\"}]
+      },
+      {
+        \"name\": \"get_result\",
+        \"modifiers\": [\"view\"],
+        \"args\": [],
+        \"body\": [{\"op\": \"return\", \"value\": \"result\"}],
+        \"returns\": \"uint256\"
+      }
+    ]
+  },
+  \"signature\": \"$SIG\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "Deploy Calculator" "$RESULT" '"success":true'
+CALC_TX=$(echo $RESULT | jq -r '.hash')
+
+sleep 4
+
+CALC=$(curl -s $BASE_URL/tx/$CALC_TX | jq -r '.transaction.to')
+echo "   Calculator address: $CALC"
+
+echo "Multiplying result (10) by 5..."
+NONCE=$(curl -s $BASE_URL/nonce/$ADDR1 | jq -r '.nonce')
+SIGN=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"call_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {\"contract\": \"$CALC\", \"method\": \"multiply\", \"args\": [\"5\"]}
+}")
+SIG=$(echo $SIGN | jq -r '.signature')
+RESULT=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"call_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {\"contract\": \"$CALC\", \"method\": \"multiply\", \"args\": [\"5\"]},
+  \"signature\": \"$SIG\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "Multiply call" "$RESULT" '"success":true'
+
+sleep 4
+
+RESULT=$(curl -s $BASE_URL/contract/$CALC/var/result)
+test_endpoint "Result = 50 after mul" "$RESULT" '"value":50'
+
+echo "Dividing 50 by 3..."
+NONCE=$(curl -s $BASE_URL/nonce/$ADDR1 | jq -r '.nonce')
+SIGN=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"call_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {\"contract\": \"$CALC\", \"method\": \"divide\", \"args\": [\"3\"]}
+}")
+SIG=$(echo $SIGN | jq -r '.signature')
+RESULT=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"call_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {\"contract\": \"$CALC\", \"method\": \"divide\", \"args\": [\"3\"]},
+  \"signature\": \"$SIG\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "Divide call" "$RESULT" '"success":true'
+
+sleep 4
+
+RESULT=$(curl -s $BASE_URL/contract/$CALC/var/result)
+test_endpoint "Result = 16 after div" "$RESULT" '"value":16'
+
+echo ""
+
+# ============================================================
+# SECTION 13: GUARD & SIGNAL (Mosh keywords)
+# ============================================================
+echo -e "${BLUE}━━━ SECTION 13: GUARD & SIGNAL ━━━${NC}"
+
+echo "Deploying contract with guard and signal..."
+NONCE=$(curl -s $BASE_URL/nonce/$ADDR1 | jq -r '.nonce')
+SIGN=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"deploy_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {
+    \"name\": \"GuardTest\",
+    \"variables\": [{\"name\": \"value\", \"type\": \"uint256\", \"default\": \"0\"}],
+    \"functions\": [
+      {
+        \"name\": \"safe_set\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"new_val\", \"type\": \"uint256\"}],
+        \"body\": [
+          {\"op\": \"guard\", \"left\": \"new_val\", \"cmp\": \">\", \"right\": \"0\", \"msg\": \"Must be positive\"},
+          {\"op\": \"set\", \"var\": \"value\", \"value\": \"new_val\"},
+          {\"op\": \"signal\", \"event_name\": \"ValueSet\", \"event_args\": [\"new_val\"]}
+        ]
+      },
+      {
+        \"name\": \"get_value\",
+        \"modifiers\": [\"view\"],
+        \"args\": [],
+        \"body\": [{\"op\": \"return\", \"value\": \"value\"}],
+        \"returns\": \"uint256\"
+      }
+    ]
+  }
+}")
+SIG=$(echo $SIGN | jq -r '.signature')
+
+RESULT=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"deploy_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {
+    \"name\": \"GuardTest\",
+    \"variables\": [{\"name\": \"value\", \"type\": \"uint256\", \"default\": \"0\"}],
+    \"functions\": [
+      {
+        \"name\": \"safe_set\",
+        \"modifiers\": [\"write\"],
+        \"args\": [{\"name\": \"new_val\", \"type\": \"uint256\"}],
+        \"body\": [
+          {\"op\": \"guard\", \"left\": \"new_val\", \"cmp\": \">\", \"right\": \"0\", \"msg\": \"Must be positive\"},
+          {\"op\": \"set\", \"var\": \"value\", \"value\": \"new_val\"},
+          {\"op\": \"signal\", \"event_name\": \"ValueSet\", \"event_args\": [\"new_val\"]}
+        ]
+      },
+      {
+        \"name\": \"get_value\",
+        \"modifiers\": [\"view\"],
+        \"args\": [],
+        \"body\": [{\"op\": \"return\", \"value\": \"value\"}],
+        \"returns\": \"uint256\"
+      }
+    ]
+  },
+  \"signature\": \"$SIG\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "Deploy GuardTest" "$RESULT" '"success":true'
+GUARD_TX=$(echo $RESULT | jq -r '.hash')
+
+sleep 4
+
+GUARD_ADDR=$(curl -s $BASE_URL/tx/$GUARD_TX | jq -r '.transaction.to')
+echo "   GuardTest address: $GUARD_ADDR"
+
+echo "Calling safe_set(42) — should succeed..."
+NONCE=$(curl -s $BASE_URL/nonce/$ADDR1 | jq -r '.nonce')
+SIGN=$(curl -s -X POST $BASE_URL/tx/sign -H "Content-Type: application/json" -d "{
+  \"private_key\": \"$PRIV1\",
+  \"tx_type\": \"call_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {\"contract\": \"$GUARD_ADDR\", \"method\": \"safe_set\", \"args\": [\"42\"]}
+}")
+SIG=$(echo $SIGN | jq -r '.signature')
+RESULT=$(curl -s -X POST $BASE_URL/tx -H "Content-Type: application/json" -d "{
+  \"tx_type\": \"call_contract\",
+  \"from\": \"$ADDR1\",
+  \"nonce\": $NONCE,
+  \"data\": {\"contract\": \"$GUARD_ADDR\", \"method\": \"safe_set\", \"args\": [\"42\"]},
+  \"signature\": \"$SIG\",
+  \"public_key\": \"$PUB1\"
+}")
+test_endpoint "safe_set(42)" "$RESULT" '"success":true'
+
+sleep 4
+
+RESULT=$(curl -s $BASE_URL/contract/$GUARD_ADDR/var/value)
+test_endpoint "Value = 42" "$RESULT" '"value":42'
+
+echo "Testing events endpoint..."
+RESULT=$(curl -s $BASE_URL/contract/$GUARD_ADDR/events)
+test_endpoint "Events endpoint" "$RESULT" '"events"'
+
+echo ""
+
+# ============================================================
+# SECTION 14: LEADERBOARD
+# ============================================================
+echo -e "${BLUE}━━━ SECTION 14: LEADERBOARD ━━━${NC}"
+
+echo "Testing GET /leaderboard..."
+RESULT=$(curl -s $BASE_URL/leaderboard)
+test_endpoint "Leaderboard endpoint" "$RESULT" '"balances"'
+test_endpoint "Has token_creators" "$RESULT" '"token_creators"'
+test_endpoint "Has contract_deployers" "$RESULT" '"contract_deployers"'
+test_endpoint "Has tx_senders" "$RESULT" '"tx_senders"'
+
+echo ""
+
+# ============================================================
+# SECTION 15: FINAL STATUS CHECK
+# ============================================================
+echo -e "${BLUE}━━━ SECTION 15: FINAL STATUS CHECK ━━━${NC}"
 
 echo "Checking final chain status..."
 STATUS=$(curl -s $BASE_URL/status)
@@ -840,10 +1105,12 @@ echo ""
 echo "============================================================"
 echo "📦 CONTRACTS DEPLOYED"
 echo "============================================================"
-echo "   Counter:   $COUNTER"
-echo "   Whitelist: $WHITELIST"  
-echo "   Vault:     $VAULT"
-echo "   Token:     $TOKEN"
+echo "   Counter:    $COUNTER"
+echo "   Whitelist:  $WHITELIST"
+echo "   Vault:      $VAULT"
+echo "   Calculator: $CALC"
+echo "   GuardTest:  $GUARD_ADDR"
+echo "   Token:      $TOKEN"
 echo ""
 echo "============================================================"
 echo "🔑 WALLETS"

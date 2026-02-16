@@ -22,13 +22,13 @@ master_balance = 1000000
 
 [faucet]
 enabled = true
-amount = 100
+amount = 1000
 cooldown = 3600
 
 [token]
 name = "MVM"
 symbol = "MVM"
-decimals = 18
+decimals = 8
 
 [node]
 id = "master"

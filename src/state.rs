@@ -307,6 +307,119 @@ impl State {
         Ok(entries)
     }
 
+    // ==================== CONTRACT EVENTS ====================
+
+    pub fn save_contract_event(&mut self, event: &crate::mvm::ContractEvent) -> Result<(), BoxError> {
+        // Key: event:{contract}:{height}:{index}
+        // Find next index for this contract+height
+        let prefix = format!("event:{}:{}:", event.contract, event.block_height);
+        let mut idx = 0u64;
+        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        for item in iter {
+            let (key, _) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if key_str.starts_with(&prefix) {
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        let key = format!("event:{}:{}:{}", event.contract, event.block_height, idx);
+        let value = serde_json::to_string(event)?;
+        self.db.put(key.as_bytes(), value.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn get_contract_events(&self, contract: &str) -> Result<Vec<crate::mvm::ContractEvent>, BoxError> {
+        let mut events = Vec::new();
+        let prefix = format!("event:{}:", contract);
+
+        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if key_str.starts_with(&prefix) {
+                let event: crate::mvm::ContractEvent = serde_json::from_slice(&value)?;
+                events.push(event);
+            } else {
+                break;
+            }
+        }
+
+        events.sort_by(|a, b| b.block_height.cmp(&a.block_height));
+        Ok(events)
+    }
+
+    // ==================== LEADERBOARD ====================
+
+    pub fn get_leaderboard(&self) -> Result<serde_json::Value, BoxError> {
+        // Top balances
+        let mut balances: Vec<(String, u64)> = Vec::new();
+        let prefix = b"balance:";
+        let iter = self.db.prefix_iterator(prefix);
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if let Some(addr) = key_str.strip_prefix("balance:") {
+                if let Ok(bytes) = value.as_ref().try_into() {
+                    let bal: u64 = u64::from_le_bytes(bytes);
+                    if bal > 0 {
+                        balances.push((addr.to_string(), bal));
+                    }
+                }
+            }
+        }
+        balances.sort_by(|a, b| b.1.cmp(&a.1));
+        balances.truncate(10);
+
+        // Top token creators
+        let all_tokens = self.get_all_tokens()?;
+        let mut creator_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for token in &all_tokens {
+            *creator_counts.entry(token.creator.clone()).or_insert(0) += 1;
+        }
+        let mut top_creators: Vec<(String, usize)> = creator_counts.into_iter().collect();
+        top_creators.sort_by(|a, b| b.1.cmp(&a.1));
+        top_creators.truncate(10);
+
+        // Top contract deployers
+        let all_contracts = self.get_all_mosh_contracts()?;
+        let mut deployer_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for c in &all_contracts {
+            *deployer_counts.entry(c.creator.clone()).or_insert(0) += 1;
+        }
+        let mut top_deployers: Vec<(String, usize)> = deployer_counts.into_iter().collect();
+        top_deployers.sort_by(|a, b| b.1.cmp(&a.1));
+        top_deployers.truncate(10);
+
+        // Top transaction senders (by nonce as proxy for tx count)
+        let mut tx_counts: Vec<(String, u64)> = Vec::new();
+        let nonce_prefix = b"nonce:";
+        let iter = self.db.prefix_iterator(nonce_prefix);
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if let Some(addr) = key_str.strip_prefix("nonce:") {
+                if let Ok(bytes) = value.as_ref().try_into() {
+                    let nonce: u64 = u64::from_le_bytes(bytes);
+                    if nonce > 0 {
+                        tx_counts.push((addr.to_string(), nonce));
+                    }
+                }
+            }
+        }
+        tx_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        tx_counts.truncate(10);
+
+        Ok(serde_json::json!({
+            "top_balances": balances.iter().map(|(a, b)| serde_json::json!({"address": a, "balance": b, "formatted": format!("{}.{:08}", b / 100_000_000, b % 100_000_000)})).collect::<Vec<_>>(),
+            "top_token_creators": top_creators.iter().map(|(a, c)| serde_json::json!({"address": a, "count": c})).collect::<Vec<_>>(),
+            "top_contract_deployers": top_deployers.iter().map(|(a, c)| serde_json::json!({"address": a, "count": c})).collect::<Vec<_>>(),
+            "top_tx_senders": tx_counts.iter().map(|(a, c)| serde_json::json!({"address": a, "count": c})).collect::<Vec<_>>(),
+        }))
+    }
+
     // Token operations (MVM-20)
     pub fn save_token(&mut self, token: &MVM20Token) -> Result<(), BoxError> {
         let key = format!("token:{}", token.address);
@@ -364,6 +477,28 @@ impl State {
         }
     }
 
+    pub fn get_token_holders(&self, contract: &str) -> Result<Vec<(String, u64)>, BoxError> {
+        let mut holders = Vec::new();
+        let prefix = format!("token_balance:{}:", contract);
+
+        let iter = self.db.prefix_iterator(prefix.as_bytes());
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = String::from_utf8(key.to_vec())?;
+            if let Some(address) = key_str.strip_prefix(&prefix) {
+                let balance = u64::from_le_bytes(
+                    value.as_ref().try_into().unwrap_or([0u8; 8])
+                );
+                if balance > 0 {
+                    holders.push((address.to_string(), balance));
+                }
+            }
+        }
+        // Sort by balance descending
+        holders.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(holders)
+    }
+
     // Faucet operations
     pub fn get_faucet_claim(&self, address: &str) -> Result<Option<i64>, BoxError> {
         let key = format!("faucet:{}", address);
@@ -394,18 +529,41 @@ impl State {
         }
     }
 
+    pub fn save_transaction(&mut self, tx: &crate::chain::Transaction) -> Result<(), BoxError> {
+        let key = format!("tx:{}", tx.hash);
+        let value = serde_json::to_string(tx)?;
+        self.db.put(key.as_bytes(), value.as_bytes())?;
+        Ok(())
+    }
+
     pub fn index_transaction(&mut self, tx: &crate::chain::Transaction, block_height: u64) -> Result<(), BoxError> {
         // Index by sender
         let from_key = format!("tx_by_addr:{}:{}", tx.from, tx.hash);
         self.db.put(from_key.as_bytes(), block_height.to_le_bytes())?;
-        
+
         // Index by recipient if exists
         if let Some(ref to) = tx.to {
             let to_key = format!("tx_by_addr:{}:{}", to, tx.hash);
             self.db.put(to_key.as_bytes(), block_height.to_le_bytes())?;
         }
-        
+
+        // Index tx hash → block height
+        let block_key = format!("tx_block:{}", tx.hash);
+        self.db.put(block_key.as_bytes(), block_height.to_le_bytes())?;
+
         Ok(())
+    }
+
+    pub fn get_transaction_block_height(&self, tx_hash: &str) -> Result<Option<u64>, BoxError> {
+        let key = format!("tx_block:{}", tx_hash);
+        match self.db.get(key.as_bytes())? {
+            Some(bytes) => {
+                let slice: &[u8] = &bytes;
+                let arr: [u8; 8] = slice.try_into().unwrap_or([0u8; 8]);
+                Ok(Some(u64::from_le_bytes(arr)))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn get_transactions_by_address(&self, address: &str, limit: usize) -> Result<Vec<crate::chain::Transaction>, BoxError> {

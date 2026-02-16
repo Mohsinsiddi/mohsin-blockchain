@@ -30,6 +30,14 @@ impl Address {
         if !self.0.starts_with(ADDRESS_HRP) {
             return false;
         }
+        // Contract and token addresses use hex format, not bech32
+        if self.0.starts_with("mvm1contract") || self.0.starts_with("mvm1token") {
+            return self.0.len() > 12 && self.0.chars().skip(4).all(|c| c.is_ascii_alphanumeric());
+        }
+        // Special addresses
+        if self.0 == "mvm1faucet" {
+            return true;
+        }
         bech32::decode(&self.0).is_ok()
     }
 
