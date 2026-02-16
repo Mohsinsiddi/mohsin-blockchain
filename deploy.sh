@@ -12,13 +12,32 @@ echo ""
 echo "  Domain: $DOMAIN"
 echo ""
 
+# ── Step 0: Ensure git + openssl are available ───────────
+echo "── Checking prerequisites ──"
+apt-get update -qq
+apt-get install -y -qq git openssl > /dev/null 2>&1
+echo "  ✅ git & openssl available"
+
 # ── Step 1: Install Docker if not present ────────────────
 if ! command -v docker &> /dev/null; then
-    echo "── Installing Docker ──"
-    curl -fsSL https://get.docker.com | sh
+    echo "── Installing Docker (official apt repo) ──"
+    apt-get update
+    apt-get install -y ca-certificates curl
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    echo "Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc" > /etc/apt/sources.list.d/docker.sources
+
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     systemctl enable docker
     systemctl start docker
-    echo "  ✅ Docker installed"
+    echo "  ✅ Docker installed (with compose plugin)"
 else
     echo "  ✅ Docker already installed"
 fi
