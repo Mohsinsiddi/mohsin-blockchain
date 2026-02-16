@@ -1,0 +1,8 @@
+target/
+data/
+certbot/
+nginx/
+*.log
+.git
+docker-compose.yml
+deploy.sh
