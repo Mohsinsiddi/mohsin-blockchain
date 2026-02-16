@@ -547,6 +547,25 @@ impl State {
             self.db.put(to_key.as_bytes(), block_height.to_le_bytes())?;
         }
 
+        // Index by contract/token address from tx data
+        if let Some(ref data) = tx.data {
+            let contract_addr = match data {
+                crate::chain::TxData::TransferToken { contract, to, .. } => {
+                    // Index by token contract AND by token recipient
+                    let to_key = format!("tx_by_addr:{}:{}", to, tx.hash);
+                    self.db.put(to_key.as_bytes(), block_height.to_le_bytes())?;
+                    Some(contract.as_str())
+                }
+                crate::chain::TxData::CallContract { contract, .. } => Some(contract.as_str()),
+                crate::chain::TxData::Call { contract, .. } => Some(contract.as_str()),
+                _ => None,
+            };
+            if let Some(addr) = contract_addr {
+                let contract_key = format!("tx_by_addr:{}:{}", addr, tx.hash);
+                self.db.put(contract_key.as_bytes(), block_height.to_le_bytes())?;
+            }
+        }
+
         // Index tx hash → block height
         let block_key = format!("tx_block:{}", tx.hash);
         self.db.put(block_key.as_bytes(), block_height.to_le_bytes())?;
